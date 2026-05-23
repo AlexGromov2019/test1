@@ -1,0 +1,222 @@
+# CLAUDE.md
+
+> Project instructions for Claude Code. Keep in sync with AGENTS.md.
+
+## Project Overview
+
+Autonomous task management system with Kanban board and AI subagents. Tasks flow through stages automatically (Backlog → Planning → Plan Ready → Implementing → Review → Done), each handled by specialized subagents routed through a pluggable runtime layer that supports multiple AI providers.
+
+## Tech Stack
+
+- **Language:** TypeScript (ES2022, ESNext modules)
+- **Monorepo:** Turborepo (npm workspaces)
+- **API:** Hono + WebSocket
+- **Database:** SQLite (better-sqlite3 + drizzle-orm)
+- **Frontend:** React 19 + Vite + TailwindCSS 4
+- **Runtime:** Pluggable adapter system (`@aif/runtime`) — built-in Claude (SDK/CLI) + Codex (SDK/CLI/API) + OpenRouter (API) adapters
+- **Agent:** Runtime-neutral coordinator + node-cron
+- **Testing:** Vitest
+
+## Project Structure
+
+```
+packages/
+├── shared/              # @aif/shared — contracts, schema, state machine, env, constants, logger
+│   └── src/
+│       ├── schema.ts        # Drizzle ORM schema (SQLite)
+│       ├── types.ts         # Shared TypeScript types + RuntimeTransport enum
+│       ├── stateMachine.ts  # Task stage transitions
+│       ├── constants.ts     # App constants
+│       ├── env.ts           # Environment validation
+│       ├── logger.ts        # Pino logger setup
+│       ├── index.ts         # Node exports
+│       └── browser.ts       # Browser-safe exports
+├── data/                # @aif/data — centralized data-access layer
+│   └── src/
+│       └── index.ts         # Repository-style DB operations for API/Agent
+├── runtime/             # @aif/runtime — pluggable AI provider abstraction
+│   └── src/
+│       ├── index.ts         # Public API exports
+│       ├── types.ts         # RuntimeAdapter interface, capabilities, execution intent
+│       ├── registry.ts      # RuntimeRegistry — adapter registration and lookup
+│       ├── bootstrap.ts     # Factory: create registry with built-in adapters
+│       ├── resolution.ts    # Profile resolution (task → project → system → env fallback)
+│       ├── readiness.ts     # Health check across all registered runtimes
+│       ├── capabilities.ts  # Capability assertion before workflow execution
+│       ├── promptPolicy.ts  # Agent definition vs slash-command fallback
+│       ├── workflowSpec.ts  # Workflow kind, session reuse, required capabilities
+│       ├── modelDiscovery.ts # Model listing + connection validation with cache
+│       ├── cache.ts         # Generic in-memory TTL cache
+│       ├── trust.ts         # Opaque Symbol-based trust token for permission bypass
+│       ├── errors.ts        # Runtime error hierarchy
+│       ├── module.ts        # Dynamic module loader for external adapters
+│       └── adapters/
+│           ├── TEMPLATE.ts      # Adapter development guide + skeleton
+│           ├── claude/          # Claude adapter (SDK + CLI + API transports)
+│           │   ├── index.ts     # Factory: createClaudeRuntimeAdapter()
+│           │   ├── options.ts   # Parse execution intent → Claude SDK query options
+│           │   ├── stream.ts    # Async stream consumer (events, text, usage)
+│           │   ├── run.ts       # Orchestrator with timeout/resume retry
+│           │   ├── cli.ts       # CLI transport: spawn `claude` with --agent/--resume
+│           │   ├── sessions.ts  # Session list/get/events via Agent SDK
+│           │   ├── hooks.ts     # SDK hook wiring + generic callback bridges
+│           │   ├── errors.ts    # Error classification (usage limit, auth, stream)
+│           │   └── diagnostics.ts # CLI probe + stderr analysis for diagnoseError()
+│           ├── codex/           # Codex adapter (SDK + CLI + API transports)
+│           │   ├── index.ts     # Factory: createCodexRuntimeAdapter()
+│           │   ├── sdk.ts       # SDK transport: @openai/codex-sdk thread lifecycle
+│           │   ├── cli.ts       # CLI transport: spawn process, parse stdout
+│           │   ├── sessions.ts  # Session management for SDK threads
+│           │   ├── api.ts       # API transport: HTTP POST to remote endpoint
+│           │   └── errors.ts    # Error classification (CLI not found, timeout, auth)
+│           └── openrouter/      # OpenRouter adapter (API transport)
+│               ├── index.ts     # Factory: createOpenRouterRuntimeAdapter()
+│               ├── api.ts       # API transport: chat completions, streaming, model discovery
+│               └── errors.ts    # Error classification (rate limit, auth, model not found)
+├── api/                 # @aif/api — Hono REST + WebSocket server (port 3009)
+│   └── src/
+│       ├── index.ts         # Server entry point
+│       ├── routes/          # tasks.ts, projects.ts, chat.ts, runtimeProfiles.ts
+│       ├── services/        # runtime.ts, fastFix.ts, roadmapGeneration.ts
+│       ├── middleware/      # logger.ts, rateLimit.ts, zodValidator.ts
+│       ├── schemas.ts       # Zod request validation
+│       └── ws.ts            # WebSocket handler
+├── web/                 # @aif/web — React Kanban UI (port 5180)
+│   └── src/
+│       ├── App.tsx          # Root component
+│       ├── components/
+│       │   ├── kanban/      # Board, Column, TaskCard, AddTaskForm
+│       │   ├── task/        # TaskDetail, TaskPlan, TaskLog, AgentTimeline
+│       │   ├── layout/      # Header, CommandPalette
+│       │   ├── project/     # ProjectSelector, ProjectRuntimeSettings
+│       │   ├── settings/    # RuntimeProfileForm
+│       │   └── ui/          # Reusable UI primitives (badge, button, dialog, etc.)
+│       ├── hooks/           # useTasks, useProjects, useWebSocket, useTheme, useRuntimeProfiles
+│       └── lib/             # api.ts, notifications.ts, utils.ts
+├── agent/               # @aif/agent — Runtime-neutral coordinator + subagents
+│   └── src/
+│       ├── index.ts         # Agent entry point
+│       ├── coordinator.ts   # Polling coordinator (node-cron)
+│       ├── subagentQuery.ts # Universal runtime-backed query execution
+│       ├── reviewGate.ts    # Auto-review gate using adapter lightModel
+│       ├── hooks.ts         # Activity logging, project root
+│       ├── stderrCollector.ts # Generic stderr ring-buffer
+│       ├── notifier.ts      # Notification system
+│       └── subagents/       # planner.ts, implementer.ts, reviewer.ts
+└── mcp/                 # @aif/mcp — MCP server for Claude Code integration
+    └── src/
+        └── tools/           # createTask.ts, updateTask.ts, getTask.ts
+
+.claude/agents/          # Agent definitions (loaded by runtimes that support them)
+.docker/                 # Dockerfile, entrypoint, Angie configs
+data/                    # SQLite database files (gitignored)
+.ai-factory/             # AI Factory context and references
+```
+
+## Key Entry Points
+
+| File                                  | Purpose                                                 |
+| ------------------------------------- | ------------------------------------------------------- |
+| `packages/api/src/index.ts`           | API server entry (Hono, port 3009)                      |
+| `packages/web/src/main.tsx`           | Web app entry (React, port 5180)                        |
+| `packages/agent/src/index.ts`         | Agent coordinator entry                                 |
+| `packages/runtime/src/index.ts`       | Runtime public API                                      |
+| `packages/runtime/src/types.ts`       | RuntimeAdapter interface + transport-aware capabilities |
+| `packages/data/src/index.ts`          | Centralized data-access API                             |
+| `packages/shared/src/schema.ts`       | Database schema (drizzle-orm)                           |
+| `packages/shared/src/stateMachine.ts` | Task state transitions                                  |
+| `turbo.json`                          | Turborepo task definitions                              |
+
+## Documentation
+
+| Document        | Path                    | Description                              |
+| --------------- | ----------------------- | ---------------------------------------- |
+| README          | README.md               | Project landing page                     |
+| Getting Started | docs/getting-started.md | Installation, setup, first steps         |
+| Architecture    | docs/architecture.md    | Agent pipeline, state machine, data flow |
+| API Reference   | docs/api.md             | REST endpoints, WebSocket events         |
+| Configuration   | docs/configuration.md   | Environment variables, logging, auth     |
+| Providers       | docs/providers.md       | Runtime adapter system, adding providers |
+
+## AI Context Files
+
+| File                        | Purpose                                          |
+| --------------------------- | ------------------------------------------------ |
+| CLAUDE.md                   | This file — project instructions for Claude Code |
+| AGENTS.md                   | Project structure map (mirrors this file)        |
+| .ai-factory/DESCRIPTION.md  | Project specification and tech stack             |
+| .ai-factory/ARCHITECTURE.md | Architecture decisions and guidelines            |
+| .ai-factory/RULES.md        | Project rules and conventions                    |
+| .ai-factory/references/     | AI provider SDK reference docs                   |
+
+## Agent Rules
+
+- Never combine shell commands with `&&`, `||`, or `;` — execute each command as a separate Bash tool call. This applies even when a skill, plan, or instruction provides a combined command — always decompose it into individual calls.
+  - Wrong: `git checkout main && git pull`
+  - Right: Two separate Bash tool calls — first `git checkout main`, then `git pull`
+
+- DB boundary is mandatory: `api`, `agent`, and `runtime` access database only through `@aif/data`. Direct imports of DB helpers from `@aif/shared/server` and direct SQL construction imports are blocked by ESLint.
+
+- **Runtime-neutral execution:** `subagentQuery.ts` is the universal entry point for all AI-backed task execution. It works through `RuntimeAdapter.run()` — never call provider SDKs directly from agent code. Provider-specific logic (hooks, permissions, diagnostics) belongs in the adapter, not in agent.
+
+- **AIF Workflow Required:** All subagents in `packages/agent/src/subagents/` MUST use `.claude/agents/` definitions via `execution.agentDefinitionName`. The runtime prompt policy handles fallback for adapters that don't support agent definitions. Exception: simple validation tasks (like `planChecker.ts`) that have no corresponding agent definition and require only a single-pass check.
+  - `planner.ts` → `plan-coordinator` (spawns `plan-polisher` for iterative refinement)
+  - `implementer.ts` → `implement-coordinator` (spawns `implement-worker` + quality sidecars)
+  - `reviewer.ts` → `review-sidecar` + `security-sidecar` (parallel review)
+
+## Package Checklist Rule
+
+**CRITICAL:** Check the `CHECKLIST.md` file and ensure all items are completed.
+
+## UI Component Rules
+
+- **Reuse existing components first.** Before creating a new UI component, check `packages/web/src/components/ui/` for an existing primitive that fits the need. Compose existing primitives (e.g. `Dialog` + `Button`) instead of writing new wrappers.
+- **Pencil sync required for new components.** If a new UI component is genuinely needed, its design must be synced with the Pencil design system (`.pen` files) using the `pencil` MCP tools (`batch_design`, `get_guidelines`). Never add a visual component to the codebase without a corresponding Pencil representation.
+- **UI primitives live in `packages/web/src/components/ui/`.** Domain-specific compositions belong in their feature folder (e.g. `components/task/`, `components/kanban/`).
+- **No expensive CSS properties.** Never use `box-shadow`, `backdrop-filter`, `filter: blur()`, `text-shadow`, or other GPU/paint-heavy CSS in components. These trigger costly compositing and repaint cycles, especially on low-end devices and during scroll/animation. Use `border`, `outline`, `opacity`, or solid `background-color` as lightweight alternatives.
+- **Theme color pairing → see [`docs/ui-theme-colors.md`](docs/ui-theme-colors.md).** Pairing rules between semantic tokens and fixed-color backgrounds, the verification checklist (light + dark), and known cases live there. Read it before touching color classes on any UI.
+- **If you fix a theme-readability bug, append to `docs/ui-theme-colors.md` → "Learnings".** Whenever a change adjusts colors to fix contrast/legibility in a theme (light or dark), add a one- or two-line dated entry with the symptom, cause, and fix. This keeps the doc the single living memory of theme-pairing pitfalls so the same class of bug does not recur.
+
+## Docker Sync Rule
+
+- **Docker config must stay in sync with packages.** When adding a new package under `packages/` or introducing new inter-package dependencies, update the Docker configuration accordingly:
+  - `.docker/Dockerfile` — add build stages, `COPY` directives, and build steps for the new package.
+  - `docker-compose.yml` / `docker-compose.production.yml` — add or update services, volumes, and dependency links as needed.
+  - Verify the Docker build still succeeds after changes: `docker compose build`.
+
+## Runtime Adapter Sync Rule
+
+- **Docs must stay in sync when adding or modifying runtime adapters.** When a new adapter is added to `packages/runtime/src/adapters/` or an existing adapter's capabilities change:
+  - `docs/providers.md` — update the "Supported Runtimes" table with the new adapter's capabilities (including the `Usage Reporting` column), transports, and light model.
+  - `packages/runtime/src/adapters/TEMPLATE.ts` — verify the template still reflects current conventions.
+  - `packages/runtime/src/bootstrap.ts` — register the new built-in adapter (or document `AIF_RUNTIME_MODULES` loading).
+  - `.docker/Dockerfile` — add any new system-level dependencies the adapter needs.
+  - **Usage reporting contract** — every adapter must declare `capabilities.usageReporting` (`FULL` / `PARTIAL` / `NONE`) and return `RuntimeRunResult.usage` as a concrete value (including explicit `null`). The discovery test in `packages/runtime/src/__tests__/bootstrap.test.ts` fails the build if a new adapter ships without a valid `usageReporting` value. See `docs/providers.md` → "Usage reporting contract".
+- **Cross-adapter consistency on shared changes.** When modifying shared runtime infrastructure (`errors.ts`, `types.ts`, `timeouts.ts`, `capabilities.ts`) or refactoring a pattern that exists across multiple adapters — enumerate ALL adapter directories under `packages/runtime/src/adapters/` and verify each is updated. Do not rely on the issue description or plan to list affected adapters — scan the directory.
+
+## Migration Version Rule
+
+- **Migration versions are append-only — never renumber or edit a merged migration.** In `packages/shared/src/db.ts` `MIGRATIONS` array, never change the `version` number or `sql` body of a migration that has already landed on `main`. If a feature branch collides on a version with `main` during merge, append the new migration at the next free slot — do NOT reuse or reorder existing version numbers.
+  - **Why:** user databases store progress via `PRAGMA user_version`. If version N is already applied and the SQL behind N is later swapped for different content, `runMigrations` filters `m.version > currentVersion` and silently skips the new content on those DBs. Result: schema drift between code and DB — missing columns, crashes at query time (see v13 runtime_limit snapshot incident).
+  - **When resolving merge conflicts in `MIGRATIONS`:** keep the first-merged entry at its original version; move the conflicting second entry to a new trailing version. Do not "reconcile" by editing either slot.
+  - **Writing a recovery migration:** `ALTER TABLE ADD COLUMN` statements are idempotent via `isIgnorableMigrationError` (duplicate column → swallowed). Safe to re-issue the same DDL in a later version to backfill DBs that skipped it.
+
+## Nullable Cast Rule
+
+- **Never use `as T` to strip a nullable return.** Helpers like `asRecord(x)`, `JSON.parse` wrappers, and other `unknown → T | null` narrowing functions can legitimately return `null`. Writing `const r = asRecord(x) as T` silently drops `| null` from the type, the TypeScript checker goes quiet, and subsequent `r.foo` access crashes at runtime on real-world nullable inputs.
+  - **Always declare the union explicitly:** `as T | null` (or skip the cast entirely).
+  - **Always guard before access:** `if (!r) return null` immediately after the cast.
+  - **Applies to all adapter parsers** that walk untrusted payloads (Codex session JSONL, Claude stream events, OpenRouter responses) — a missing/null field is normal, not exceptional.
+
+## Structured Error Classification Rule
+
+- **Never use string/pattern matching on error messages to branch logic.** All error classification must go through structured fields: `category` (enum from `RuntimeErrorCategory`), `adapterCode`, or `httpStatus`. Message text is for logging and diagnostics only — never use `.includes()`, regex, or substring checks on `error.message` to make control-flow decisions.
+  - Classifiers (`classifyBy*` in `packages/runtime/src/errors.ts`) are the single entry point for mapping raw errors to structured categories.
+  - Each adapter's `errors.ts` must preserve structured context (HTTP status, adapter code) on the error object so consumers can branch on it without re-parsing the message.
+  - When adding a new error condition, extend the `RuntimeErrorCategory` enum or add a new `adapterCode` — do not add a new message pattern check.
+
+## Project Rules
+
+- Every package must maintain at least 70% test coverage (measured by @vitest/coverage-v8)
+- Write code following SOLID and DRY principles
+- Always run after implementation: `npm run ai:validate`

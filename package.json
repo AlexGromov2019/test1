@@ -1,0 +1,68 @@
+{
+  "name": "aif-handoff",
+  "version": "0.1.0",
+  "description": "Autonomous task management system with Kanban board and AI subagents",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lee-to/aif-handoff.git"
+  },
+  "author": "AIF Handoff Maintainers",
+  "keywords": [
+    "ai",
+    "agents",
+    "kanban",
+    "task-management",
+    "automation",
+    "claude",
+    "subagents"
+  ],
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "init": "npm run db:setup",
+    "dev": "node ./scripts/dev.mjs",
+    "dev:perf": "turbo run dev:perf --filter @aif/api --filter @aif/web --filter @aif/agent",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "test": "turbo test",
+    "coverage": "turbo coverage --concurrency=1",
+    "mutation": "node scripts/mutation.mjs",
+    "mutation:dry-run": "node scripts/mutation.mjs --dryRunOnly",
+    "db:setup": "npm run db:setup --workspace=@aif/shared",
+    "db:push": "turbo db:push --filter=@aif/shared",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "ai:validate": "npm run format:check && npm run lint && npm run test && npm run coverage && npm run build && npm run ai:perf && npm run ai:load && npm run ai:protocol && npm run ai:checklist",
+    "ai:perf": "npm run perf --workspace=@aif/web",
+    "ai:load": "node packages/api/perf/run.mjs",
+    "ai:protocol": "npm run codex:app-server:protocol:check --workspace=@aif/runtime",
+    "ai:checklist": "node -e \"console.log('[WARNING] check CHECKLIST.md')\"",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx,json,md,css}": "prettier --write"
+  },
+  "devDependencies": {
+    "@stryker-mutator/core": "^9.6.1",
+    "@stryker-mutator/vitest-runner": "^9.6.1",
+    "@vitest/coverage-v8": "^4.1.2",
+    "ai-factory": "^2.11.0",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "globals": "^17.4.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.1",
+    "turbo": "^2.8.21",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.57.2"
+  },
+  "packageManager": "npm@11.12.1"
+}

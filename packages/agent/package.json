@@ -1,0 +1,31 @@
+{
+  "name": "@aif/agent",
+  "version": "0.1.0",
+  "description": "AI coordinator and subagents for AIF Handoff",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --import tsx src/index.ts",
+    "dev:perf": "node --import tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.ts",
+    "test": "vitest run --configLoader runner",
+    "coverage": "vitest run --coverage",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test:watch": "vitest --configLoader runner"
+  },
+  "dependencies": {
+    "@aif/data": "*",
+    "@aif/runtime": "*",
+    "@aif/shared": "*",
+    "@hono/node-server": "^1.19.13",
+    "hono": "^4.12.12",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.2"
+  }
+}

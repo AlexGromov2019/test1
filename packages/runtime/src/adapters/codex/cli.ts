@@ -1,0 +1,1053 @@
+import { spawn, execFileSync } from "node:child_process";
+import type { RuntimeEvent, RuntimeRunInput, RuntimeRunResult, RuntimeUsage } from "../../types.js";
+import { buildRuntimeLimitEvent } from "../../limitEvents.js";
+import {
+  makeProcessRunTimeoutError,
+  makeProcessStartTimeoutError,
+  resolveRetryDelay,
+  sleepMs,
+  withProcessTimeouts,
+} from "../../timeouts.js";
+import { classifyCodexRuntimeError } from "./errors.js";
+import { getCodexSessionLimitSnapshot } from "./sessions.js";
+import { assertSafeWindowsShellExecutablePath } from "../../shellSafety.js";
+import {
+  normalizeCodexApprovalPolicy,
+  normalizeCodexSandboxMode,
+  warnOnInvalidCodexPermissionOverride,
+  type CodexApprovalPolicy,
+  type CodexSandboxMode,
+} from "./permissions.js";
+
+const IS_WINDOWS = process.platform === "win32";
+
+export interface CodexCliLogger {
+  debug?(context: Record<string, unknown>, message: string): void;
+  info?(context: Record<string, unknown>, message: string): void;
+  warn?(context: Record<string, unknown>, message: string): void;
+  error?(context: Record<string, unknown>, message: string): void;
+}
+
+const CODEX_SESSION_LIMIT_POLL_INTERVAL_MS = 1_000;
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+const CODEX_CLI_EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh"] as const);
+
+type CodexCliEffortLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+function normalizeCodexCliEffort(value: unknown): CodexCliEffortLevel | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase();
+    if (CODEX_CLI_EFFORT_LEVELS.has(trimmed as CodexCliEffortLevel)) {
+      return trimmed as CodexCliEffortLevel;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the effective approval policy and sandbox mode for a Codex CLI run.
+ *
+ * Three-layer precedence:
+ *   1. explicit profile options (`options.approvalPolicy` / `options.sandboxMode`)
+ *   2. bypass defaults (when `execution.bypassPermissions=true`)
+ *   3. stable non-bypass defaults (`on-request` + `workspace-write`)
+ *
+ * The non-bypass defaults keep behaviour consistent across hosts regardless
+ * of the user's ~/.codex/config.toml — prior to the bypass-permissions
+ * refactor these defaults were set by a Codex-specific hook factory in the
+ * API layer; the logic now lives inside the adapter so api/agent/runtime all
+ * share the same contract.
+ *
+ * Values are always non-null — the caller always emits the corresponding
+ * `-c approval_policy="..."` / `-c sandbox_mode="..."` override. Routing
+ * through `-c` rather than `--sandbox` / the atomic
+ * `--dangerously-bypass-approvals-and-sandbox` flag is required because the
+ * `codex exec resume` subcommand rejects `--sandbox` outright.
+ */
+function resolveCodexPermissionOverrides(
+  input: RuntimeRunInput,
+  logger?: CodexCliLogger,
+): {
+  approvalPolicy: CodexApprovalPolicy;
+  sandboxMode: CodexSandboxMode;
+} {
+  const options = asRecord(input.options);
+  const rawApproval = readString(options.approvalPolicy);
+  const rawSandbox = readString(options.sandboxMode);
+  const explicitApproval = normalizeCodexApprovalPolicy(rawApproval);
+  const explicitSandbox = normalizeCodexSandboxMode(rawSandbox);
+  const bypass = input.execution?.bypassPermissions === true;
+
+  warnOnInvalidCodexPermissionOverride({
+    logger,
+    runtimeId: input.runtimeId,
+    transport: "cli",
+    field: "approvalPolicy",
+    rawValue: rawApproval,
+    normalizedValue: explicitApproval,
+  });
+  warnOnInvalidCodexPermissionOverride({
+    logger,
+    runtimeId: input.runtimeId,
+    transport: "cli",
+    field: "sandboxMode",
+    rawValue: rawSandbox,
+    normalizedValue: explicitSandbox,
+  });
+
+  const resolved = {
+    approvalPolicy: explicitApproval ?? (bypass ? "never" : "on-request"),
+    sandboxMode: explicitSandbox ?? (bypass ? "danger-full-access" : "workspace-write"),
+  };
+
+  logger?.debug?.(
+    {
+      runtimeId: input.runtimeId,
+      transport: "cli",
+      approvalPolicy: resolved.approvalPolicy,
+      sandboxMode: resolved.sandboxMode,
+      approvalSource: explicitApproval ? "options" : bypass ? "bypass-default" : "default",
+      sandboxSource: explicitSandbox ? "options" : bypass ? "bypass-default" : "default",
+      bypassPermissions: bypass,
+    },
+    "Resolved Codex CLI approval and sandbox settings",
+  );
+
+  return resolved;
+}
+
+function readStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const parsed = value.filter((entry): entry is string => typeof entry === "string");
+  return parsed.length > 0 ? parsed : null;
+}
+
+interface NormalizedCliArgs {
+  args: string[];
+  /**
+   * True when the configured custom `codexCliArgs` embedded the prompt via a
+   * `{prompt}` placeholder anywhere in any arg (including composite shapes
+   * like `--payload=prefix {prompt} suffix`). Tracked pre-substitution — the
+   * literal `{prompt}` token is gone from `args` after `normalizeCliArgs()`
+   * returns, so the flag is the only reliable signal for the stdin suppressor.
+   */
+  usesPromptPlaceholder: boolean;
+}
+
+function normalizeCliArgs(
+  input: RuntimeRunInput,
+  effectivePrompt: string,
+  logger?: CodexCliLogger,
+): NormalizedCliArgs {
+  const options = asRecord(input.options);
+  const configured = readStringArray(options.codexCliArgs);
+
+  // Custom args — apply template substitutions.
+  //
+  // `effectivePrompt` already carries `execution.systemPromptAppend`
+  // prepended by `composePrompt()` so the registry's language directive
+  // (and any other cross-cutting append) reaches the model via the
+  // `{prompt}` placeholder too — not only through the default stdin path.
+  if (configured) {
+    let usesPromptPlaceholder = false;
+    const args = configured.map((arg) => {
+      if (arg.includes("{prompt}")) {
+        usesPromptPlaceholder = true;
+      }
+      return arg
+        .replaceAll("{prompt}", effectivePrompt)
+        .replaceAll("{model}", input.model ?? "")
+        .replaceAll("{session_id}", input.sessionId ?? "");
+    });
+    return { args, usesPromptPlaceholder };
+  }
+
+  // Default args — resume session or fresh exec
+  const args: string[] = ["exec"];
+  if (input.resume && input.sessionId) {
+    args.push("resume", input.sessionId);
+  }
+  args.push("--json");
+  if (input.model) {
+    args.push("--model", input.model);
+  }
+  const effort = normalizeCodexCliEffort(options.modelReasoningEffort);
+  if (effort) {
+    args.push("-c", `model_reasoning_effort="${effort}"`);
+  }
+
+  // Skip git repo check — opt-in via profile for non-git working directories
+  if (options.skipGitRepoCheck === true) {
+    args.push("--skip-git-repo-check");
+  }
+
+  // Approval policy and sandbox mode. Always emitted so behaviour stays
+  // stable across hosts regardless of the user's ~/.codex/config.toml.
+  //
+  //   bypass=false, no profile override → "on-request" + "workspace-write"
+  //   bypass=true,  no profile override → "never"      + "danger-full-access"
+  //   explicit `options.approvalPolicy` / `options.sandboxMode` always win
+  //
+  // Routed via `-c` rather than `--sandbox` or the atomic
+  // `--dangerously-bypass-approvals-and-sandbox` flag — `codex exec resume`
+  // rejects `--sandbox`, and `-c` overrides work uniformly across both the
+  // fresh exec and resume paths.
+  const { approvalPolicy, sandboxMode } = resolveCodexPermissionOverrides(input, logger);
+  args.push("-c", `approval_policy="${approvalPolicy}"`);
+  args.push("-c", `sandbox_mode="${sandboxMode}"`);
+
+  return { args, usesPromptPlaceholder: false };
+}
+
+const ALLOWED_ENV_PREFIXES = [
+  "OPENAI_",
+  "CODEX_",
+  "AIF_",
+  "HANDOFF_",
+  "NODE_",
+  "HOME",
+  "USER",
+  "LANG",
+  "LC_",
+  "PATH",
+  "SHELL",
+  "TERM",
+  "TMPDIR",
+  "TZ",
+  "XDG_",
+  "FORCE_COLOR",
+  "NO_COLOR",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+];
+
+/**
+ * Env vars that must NOT be forwarded to the Codex CLI even if they match
+ * an allowed prefix.  `OPENAI_BASE_URL` is deprecated by the Codex CLI —
+ * it causes a WebSocket endpoint mis-derivation (`wss://.../v1/responses`)
+ * and 500 errors.  The CLI reads `openai_base_url` from `config.toml` instead.
+ */
+const BLOCKED_ENV_KEYS = new Set(["OPENAI_BASE_URL"]);
+
+interface CuratedEnvResult {
+  env: Record<string, string>;
+  forwardedCount: number;
+  filteredCount: number;
+  blockedCount: number;
+  droppedDisallowedPrefixKeys: string[];
+}
+
+function buildCuratedEnv(apiKeyEnvVar: string): CuratedEnvResult {
+  const env: Record<string, string> = {};
+  let forwardedCount = 0;
+  let filteredCount = 0;
+  let blockedCount = 0;
+  const droppedDisallowedPrefixKeys = new Set<string>();
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value == null) continue;
+    if (BLOCKED_ENV_KEYS.has(key)) {
+      blockedCount += 1;
+      continue;
+    }
+    if (
+      key === apiKeyEnvVar ||
+      ALLOWED_ENV_PREFIXES.some((prefix) => key === prefix || key.startsWith(prefix))
+    ) {
+      env[key] = value;
+      forwardedCount += 1;
+    } else {
+      filteredCount += 1;
+      if (key.startsWith("npm_")) {
+        droppedDisallowedPrefixKeys.add(key);
+      }
+    }
+  }
+  return {
+    env,
+    forwardedCount,
+    filteredCount,
+    blockedCount,
+    droppedDisallowedPrefixKeys: [...droppedDisallowedPrefixKeys],
+  };
+}
+
+function resolveCliPath(input: RuntimeRunInput): string {
+  const options = asRecord(input.options);
+  return readString(options.codexCliPath) ?? readString(process.env.CODEX_CLI_PATH) ?? "codex";
+}
+
+/**
+ * Probe whether the Codex CLI is actually reachable by running `codex --version`.
+ * On Windows bare command names like `"codex"` need `shell: true` to resolve `.cmd`.
+ */
+export function probeCodexCli(cliPath: string): { ok: boolean; version?: string; error?: string } {
+  try {
+    if (IS_WINDOWS) {
+      assertSafeWindowsShellExecutablePath(cliPath, "Codex CLI path");
+    }
+    const out = execFileSync(cliPath, ["--version"], {
+      timeout: 5_000,
+      shell: IS_WINDOWS,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return { ok: true, version: out.toString().trim() };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: message };
+  }
+}
+
+function resolveTimeoutMs(input: RuntimeRunInput): number {
+  const exec = input.execution;
+  if (
+    typeof exec?.runTimeoutMs === "number" &&
+    Number.isFinite(exec.runTimeoutMs) &&
+    exec.runTimeoutMs > 0
+  ) {
+    return Math.floor(exec.runTimeoutMs);
+  }
+  return 120_000;
+}
+
+/* v8 ignore start -- Windows-only spawn logic, untestable in macOS/Linux CI */
+function quoteIfNeeded(arg: string): string {
+  return arg.includes(" ") || arg.includes('"') ? `"${arg.replace(/"/g, '\\"')}"` : arg;
+}
+
+function spawnCliWindows(
+  cliPath: string,
+  args: string[],
+  cwd: string | undefined,
+  env: Record<string, string>,
+) {
+  assertSafeWindowsShellExecutablePath(cliPath, "Codex CLI path");
+  const cmd = process.env.ComSpec ?? "cmd.exe";
+  const cmdLine = [cliPath, ...args.map(quoteIfNeeded)].join(" ");
+  return spawn(cmd, ["/d", "/c", cmdLine], {
+    cwd,
+    env,
+    stdio: "pipe",
+    windowsVerbatimArguments: true,
+  });
+}
+/* v8 ignore stop */
+
+// ---------------------------------------------------------------------------
+// stream-json (JSONL) line processor
+// ---------------------------------------------------------------------------
+
+interface CodexItem {
+  id?: string;
+  type?: string;
+  text?: string;
+  command?: string;
+  aggregated_output?: string;
+  exit_code?: number | null;
+  status?: string;
+  [key: string]: unknown;
+}
+
+interface CodexStreamMessage {
+  type?: string;
+  thread_id?: string;
+  item?: CodexItem;
+  text?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+    cached_input_tokens?: number;
+  };
+  total_cost_usd?: number;
+  cost_usd?: number;
+  // Legacy single-blob fields used by custom `codexCliArgs` integrations
+  outputText?: string;
+  result?: string;
+  sessionId?: string;
+  events?: Array<Record<string, unknown>>;
+}
+
+interface CodexCliStreamState {
+  sessionId: string | null;
+  outputText: string;
+  usage: RuntimeUsage | null;
+  events: RuntimeEvent[];
+  plainTextFallback: string;
+  /** Raw parsed JSONL events — preserved in `raw` for compatibility. */
+  rawEvents: Array<Record<string, unknown>>;
+  /** True once we have seen any JSONL line that was successfully parsed. */
+  sawAnyJsonLine: boolean;
+}
+
+function createCodexStreamState(fallbackSessionId: string | null): CodexCliStreamState {
+  return {
+    sessionId: fallbackSessionId,
+    outputText: "",
+    usage: null,
+    events: [],
+    plainTextFallback: "",
+    rawEvents: [],
+    sawAnyJsonLine: false,
+  };
+}
+
+function summarizeToolInput(input: unknown): string {
+  if (input == null) return "";
+  if (typeof input === "string") {
+    return input.length > 100 ? `${input.slice(0, 97)}...` : input;
+  }
+  try {
+    const json = JSON.stringify(input);
+    if (json.length <= 120) return json;
+    return `${json.slice(0, 117)}...`;
+  } catch {
+    return "";
+  }
+}
+
+function displayNameForCodexTool(itemType: string): string {
+  // Map internal codex item types to friendlier activity names that match
+  // the Claude convention where possible, so the UI shows "Bash ls" etc.
+  switch (itemType) {
+    case "command_execution":
+      return "Bash";
+    case "file_read":
+      return "Read";
+    case "file_write":
+      return "Write";
+    case "file_edit":
+      return "Edit";
+    default:
+      return itemType;
+  }
+}
+
+function emitCodexEvent(
+  state: CodexCliStreamState,
+  execution: RuntimeRunInput["execution"],
+  event: RuntimeEvent,
+): void {
+  state.events.push(event);
+  execution?.onEvent?.(event);
+}
+
+function accumulateCodexUsage(state: CodexCliStreamState, message: CodexStreamMessage): void {
+  const usage = message.usage;
+  if (!usage) return;
+  const rawInput = usage.input_tokens ?? 0;
+  const cached = usage.cached_input_tokens ?? 0;
+  const inputTokens = rawInput + cached;
+  const outputTokens = usage.output_tokens ?? 0;
+  const totalTokens = usage.total_tokens ?? inputTokens + outputTokens;
+  const costRaw = message.total_cost_usd ?? message.cost_usd;
+  if (state.usage) {
+    state.usage = {
+      inputTokens: state.usage.inputTokens + inputTokens,
+      outputTokens: state.usage.outputTokens + outputTokens,
+      totalTokens: state.usage.totalTokens + totalTokens,
+      costUsd:
+        typeof costRaw === "number" ? (state.usage.costUsd ?? 0) + costRaw : state.usage.costUsd,
+    };
+  } else {
+    state.usage = {
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      costUsd: typeof costRaw === "number" ? costRaw : undefined,
+    };
+  }
+}
+
+function processCodexJsonLine(
+  line: string,
+  state: CodexCliStreamState,
+  execution: RuntimeRunInput["execution"],
+): void {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  let message: CodexStreamMessage;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      state.plainTextFallback += (state.plainTextFallback ? "\n" : "") + trimmed;
+      return;
+    }
+    message = parsed as CodexStreamMessage;
+  } catch {
+    state.plainTextFallback += (state.plainTextFallback ? "\n" : "") + trimmed;
+    return;
+  }
+
+  state.sawAnyJsonLine = true;
+  state.rawEvents.push(message as unknown as Record<string, unknown>);
+
+  const type = typeof message.type === "string" ? message.type : "";
+  const nowIso = new Date().toISOString();
+
+  if (type === "thread.started") {
+    if (typeof message.thread_id === "string" && message.thread_id.length > 0) {
+      state.sessionId = message.thread_id;
+    }
+    emitCodexEvent(state, execution, {
+      type: "system:init",
+      timestamp: nowIso,
+      level: "debug",
+      message: "Codex thread started",
+      data: { sessionId: state.sessionId },
+    });
+    return;
+  }
+
+  if (type === "item.started" && message.item) {
+    const item = message.item;
+    const itemType = typeof item.type === "string" ? item.type : "";
+    if (itemType && itemType !== "agent_message") {
+      const displayName = displayNameForCodexTool(itemType);
+      // Prefer the `command` field for shell tools, otherwise summarize the
+      // whole item object so the activity line carries meaningful context.
+      const detailSource: unknown =
+        typeof item.command === "string"
+          ? item.command
+          : { ...item, id: undefined, status: undefined };
+      const summary = summarizeToolInput(detailSource);
+      const detailSuffix = summary ? ` ${summary}` : "";
+      emitCodexEvent(state, execution, {
+        type: "tool:use",
+        timestamp: nowIso,
+        level: "info",
+        message: `${displayName}${detailSuffix}`,
+        data: { name: displayName, itemType, item },
+      });
+      execution?.onToolUse?.(displayName, detailSuffix);
+    }
+    return;
+  }
+
+  if (type === "item.completed" && message.item) {
+    const item = message.item;
+    const itemType = typeof item.type === "string" ? item.type : "";
+    if (itemType === "agent_message" && typeof item.text === "string") {
+      if (state.outputText) state.outputText += "\n\n";
+      state.outputText += item.text;
+      emitCodexEvent(state, execution, {
+        type: "stream:text",
+        timestamp: nowIso,
+        level: "debug",
+        message: item.text,
+        data: { text: item.text },
+      });
+    }
+    // Tool-complete events are intentionally not re-surfaced — the
+    // `item.started` already emitted tool:use, and re-emitting on completion
+    // would double-log in agent activity.
+    return;
+  }
+
+  // Legacy "message" event (older codex CLI format)
+  if (type === "message" && typeof message.text === "string") {
+    if (state.outputText) state.outputText += "\n\n";
+    state.outputText += message.text;
+    emitCodexEvent(state, execution, {
+      type: "stream:text",
+      timestamp: nowIso,
+      level: "debug",
+      message: message.text,
+      data: { text: message.text },
+    });
+    return;
+  }
+
+  if (type === "turn.completed") {
+    accumulateCodexUsage(state, message);
+    emitCodexEvent(state, execution, {
+      type: "result:success",
+      timestamp: nowIso,
+      level: "info",
+      message: "Codex turn completed",
+      data: { usage: message.usage },
+    });
+    return;
+  }
+
+  // Other event types (turn.started, rate limit, etc.) are ignored.
+}
+
+function finalizeCodexResult(
+  state: CodexCliStreamState,
+  fallbackSessionId: string | null,
+): RuntimeRunResult {
+  // Backwards-compat: if custom `codexCliArgs` integrations emit a single
+  // AIF-specific JSON blob (with outputText/result/sessionId/usage/events),
+  // we will have parsed it as a single message in rawEvents but none of the
+  // streaming handlers matched. Recover that shape here.
+  if (
+    state.rawEvents.length === 1 &&
+    !state.outputText &&
+    (state.rawEvents[0].outputText != null || state.rawEvents[0].result != null)
+  ) {
+    const parsed = state.rawEvents[0] as CodexStreamMessage & {
+      usage?: Record<string, number>;
+    };
+    const usageRaw = parsed.usage as Record<string, number> | undefined;
+    const legacyEvents = Array.isArray((parsed as Record<string, unknown>).events)
+      ? ((parsed as Record<string, unknown>).events as Array<Record<string, unknown>>).map((e) => ({
+          type: String(e.type ?? "unknown"),
+          timestamp: typeof e.timestamp === "string" ? e.timestamp : new Date().toISOString(),
+          message: typeof e.message === "string" ? e.message : undefined,
+          data: e.data as Record<string, unknown> | undefined,
+        }))
+      : undefined;
+    return {
+      outputText: String(parsed.outputText ?? parsed.result ?? ""),
+      sessionId:
+        typeof (parsed as Record<string, unknown>).sessionId === "string"
+          ? ((parsed as Record<string, unknown>).sessionId as string)
+          : fallbackSessionId,
+      usage: usageRaw
+        ? {
+            inputTokens: usageRaw.inputTokens ?? usageRaw.input_tokens ?? 0,
+            outputTokens: usageRaw.outputTokens ?? usageRaw.output_tokens ?? 0,
+            totalTokens:
+              usageRaw.totalTokens ??
+              usageRaw.total_tokens ??
+              (usageRaw.inputTokens ?? usageRaw.input_tokens ?? 0) +
+                (usageRaw.outputTokens ?? usageRaw.output_tokens ?? 0),
+            costUsd: usageRaw.costUsd ?? usageRaw.cost_usd,
+          }
+        : null,
+      events: legacyEvents,
+      raw: parsed,
+    };
+  }
+
+  // No JSONL events parsed at all — expose raw stdout as plain text.
+  if (!state.sawAnyJsonLine) {
+    const raw = state.plainTextFallback;
+    return {
+      outputText: raw,
+      sessionId: fallbackSessionId,
+      usage: null,
+      raw,
+    };
+  }
+
+  return {
+    outputText: state.outputText,
+    sessionId: state.sessionId ?? fallbackSessionId,
+    usage: state.usage ?? null,
+    events: state.events,
+    raw: state.rawEvents,
+  };
+}
+
+function hasRuntimeLimitSnapshotSignature(
+  events: RuntimeEvent[] | null | undefined,
+  signature: string,
+): boolean {
+  return (
+    events?.some((event) => {
+      if (event.type !== "runtime:limit") {
+        return false;
+      }
+      return JSON.stringify(event.data?.snapshot ?? null) === signature;
+    }) ?? false
+  );
+}
+
+async function appendCodexSessionLimitEvent(input: RuntimeRunInput, result: RuntimeRunResult) {
+  const sessionId = result.sessionId ?? null;
+  if (!sessionId) {
+    return result;
+  }
+
+  const snapshot = await getCodexSessionLimitSnapshot({
+    sessionId,
+    runtimeId: input.runtimeId,
+    providerId: input.providerId ?? "openai",
+    profileId: input.profileId ?? null,
+  });
+  if (!snapshot) {
+    return result;
+  }
+
+  const signature = JSON.stringify(snapshot);
+  if (hasRuntimeLimitSnapshotSignature(result.events, signature)) {
+    return result;
+  }
+
+  const limitEvent = buildRuntimeLimitEvent(snapshot, "token_count");
+  const nextEvents = [...(result.events ?? []), limitEvent];
+  input.execution?.onEvent?.(limitEvent);
+
+  return {
+    ...result,
+    events: nextEvents,
+  };
+}
+
+interface CodexSessionLimitObserverState {
+  lastCheckedAtMs: number;
+  lastSignature: string | null;
+}
+
+async function maybeEmitCodexSessionLimitEvent(input: {
+  runtimeInput: RuntimeRunInput;
+  sessionId: string | null;
+  state: CodexCliStreamState;
+  observerState: CodexSessionLimitObserverState;
+  logger?: CodexCliLogger;
+  force?: boolean;
+}): Promise<void> {
+  const sessionId = input.sessionId;
+  if (!sessionId) {
+    return;
+  }
+
+  const nowMs = Date.now();
+  if (
+    input.force !== true &&
+    input.observerState.lastCheckedAtMs > 0 &&
+    nowMs - input.observerState.lastCheckedAtMs < CODEX_SESSION_LIMIT_POLL_INTERVAL_MS
+  ) {
+    return;
+  }
+  input.observerState.lastCheckedAtMs = nowMs;
+
+  const snapshot = await getCodexSessionLimitSnapshot({
+    sessionId,
+    runtimeId: input.runtimeInput.runtimeId,
+    providerId: input.runtimeInput.providerId ?? "openai",
+    profileId: input.runtimeInput.profileId ?? null,
+  });
+  if (!snapshot) {
+    return;
+  }
+
+  const signature = JSON.stringify(snapshot);
+  if (input.observerState.lastSignature === signature) {
+    return;
+  }
+  input.observerState.lastSignature = signature;
+
+  const limitEvent = buildRuntimeLimitEvent(snapshot, "token_count");
+  emitCodexEvent(input.state, input.runtimeInput.execution, limitEvent);
+  input.logger?.debug?.(
+    {
+      runtimeId: input.runtimeInput.runtimeId,
+      transport: "cli",
+      sessionId,
+      status: snapshot.status,
+      checkedAt: snapshot.checkedAt,
+    },
+    "Observed Codex session token_count rate limits during CLI run",
+  );
+}
+
+/**
+ * Compose the prompt that actually reaches the model: `systemPromptAppend`
+ * (registry-injected language directive + any other cross-cutting appends)
+ * prepended to `input.prompt`, separated by a blank line.
+ *
+ * The Codex CLI has no dedicated system-prompt slot, so this is the only way
+ * to deliver `execution.systemPromptAppend` to the model. Computing it once
+ * at the top of the run and threading it through both template substitution
+ * and stdin write keeps delivery guarantees uniform across the default path
+ * AND custom `codexCliArgs` escape hatches that use `{prompt}`.
+ */
+function composePrompt(input: RuntimeRunInput): string {
+  const append = input.execution?.systemPromptAppend?.trim();
+  return append ? `${append}\n\n${input.prompt}` : input.prompt;
+}
+
+function shouldWritePromptToStdin(args: string[], usesPromptPlaceholder: boolean): boolean {
+  // Any custom arg that embedded `{prompt}` already carries the composed
+  // prompt after substitution — including composite shapes like
+  // `--payload=prefix {prompt} suffix` that the `--prompt`/`--prompt=*` check
+  // below would not catch. `usesPromptPlaceholder` captures that signal
+  // pre-substitution, so we can suppress stdin uniformly.
+  //
+  // A prior `args.includes(prompt)` branch was intentionally removed: the
+  // default-path `args` always carry generic tokens like `exec`, `--json`, or
+  // the model id, so a user prompt that happens to equal one of those would
+  // be false-positive-matched and never delivered. The placeholder flag plus
+  // the explicit `--prompt` check cover every legitimate embed path already.
+  if (usesPromptPlaceholder) return false;
+  return !args.some((arg) => arg === "--prompt" || arg.startsWith("--prompt="));
+}
+
+function spawnCodexProcess(
+  input: RuntimeRunInput,
+  cliPath: string,
+  args: string[],
+  env: Record<string, string>,
+): ReturnType<typeof spawn> {
+  /* v8 ignore next 2 -- Windows branch */
+  return IS_WINDOWS
+    ? spawnCliWindows(cliPath, args, input.cwd ?? input.projectRoot, env)
+    : spawn(cliPath, args, { cwd: input.cwd ?? input.projectRoot, env, stdio: "pipe" });
+}
+
+function runCodexCliAttempt(
+  input: RuntimeRunInput,
+  cliPath: string,
+  args: string[],
+  env: Record<string, string>,
+  composedPrompt: string,
+  usesPromptPlaceholder: boolean,
+  logger?: CodexCliLogger,
+): Promise<{ result: RuntimeRunResult; startTimedOut: boolean }> {
+  const execution = input.execution;
+  const child = spawnCodexProcess(input, cliPath, args, env);
+
+  // Attach shared timeout utilities
+  const timeouts = withProcessTimeouts(child, {
+    startTimeoutMs: execution?.startTimeoutMs,
+    runTimeoutMs: execution?.runTimeoutMs ?? resolveTimeoutMs(input),
+  });
+
+  const state = createCodexStreamState(input.sessionId ?? null);
+  const limitObserverState: CodexSessionLimitObserverState = {
+    lastCheckedAtMs: 0,
+    lastSignature: null,
+  };
+  let stdoutBuffer = "";
+  let stderr = "";
+  let limitPollChain = Promise.resolve();
+
+  const scheduleLimitPoll = (force = false): void => {
+    limitPollChain = limitPollChain
+      .then(() =>
+        maybeEmitCodexSessionLimitEvent({
+          runtimeInput: input,
+          sessionId: state.sessionId,
+          state,
+          observerState: limitObserverState,
+          logger,
+          force,
+        }),
+      )
+      .catch((err) => {
+        logger?.warn?.(
+          {
+            runtimeId: input.runtimeId,
+            transport: "cli",
+            sessionId: state.sessionId,
+            err,
+          },
+          "Failed to inspect Codex session token_count rate limits during CLI run",
+        );
+      });
+  };
+
+  const flushCompleteLines = (): void => {
+    let newlineIdx = stdoutBuffer.indexOf("\n");
+    while (newlineIdx !== -1) {
+      const line = stdoutBuffer.slice(0, newlineIdx);
+      stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
+      processCodexJsonLine(line, state, execution);
+      scheduleLimitPoll();
+      newlineIdx = stdoutBuffer.indexOf("\n");
+    }
+  };
+
+  child.stdout!.on("data", (chunk: Buffer | string) => {
+    stdoutBuffer += String(chunk);
+    try {
+      flushCompleteLines();
+    } catch (err) {
+      logger?.error?.(
+        { runtimeId: input.runtimeId, err },
+        "Codex CLI stream-json processing error",
+      );
+    }
+  });
+
+  child.stderr!.on("data", (chunk: Buffer | string) => {
+    const text = String(chunk);
+    stderr += text;
+    execution?.onStderr?.(text);
+  });
+
+  // If abort is requested, kill the child
+  if (execution?.abortController) {
+    execution.abortController.signal.addEventListener(
+      "abort",
+      () => {
+        child.kill("SIGTERM");
+      },
+      { once: true },
+    );
+  }
+
+  child.stdin!.on("error", () => {
+    // Ignore broken-pipe errors — the child may exit before stdin is fully written
+  });
+  // `composedPrompt` already includes `execution.systemPromptAppend`
+  // prepended to the user prompt (see `composePrompt()`). When custom
+  // `codexCliArgs` embed the prompt via `{prompt}` or `--prompt`, the same
+  // value was substituted into `args`, so `shouldWritePromptToStdin()` skips
+  // stdin here to avoid sending the prompt twice.
+  if (shouldWritePromptToStdin(args, usesPromptPlaceholder)) {
+    child.stdin!.write(composedPrompt);
+  }
+  child.stdin!.end();
+
+  return new Promise((resolve, reject) => {
+    child.on("error", (error) => {
+      timeouts.cleanup();
+      reject(classifyCodexRuntimeError(error));
+    });
+
+    child.on("close", async (code) => {
+      timeouts.cleanup();
+
+      // Flush any trailing buffer content as a final line.
+      if (stdoutBuffer.length > 0) {
+        try {
+          processCodexJsonLine(stdoutBuffer, state, execution);
+          scheduleLimitPoll();
+        } catch {
+          /* ignore tail processing errors */
+        }
+        stdoutBuffer = "";
+      }
+
+      scheduleLimitPoll(true);
+      await limitPollChain;
+
+      const startTimedOut = await timeouts.startTimedOut;
+
+      if (startTimedOut) {
+        logger?.warn?.(
+          { runtimeId: input.runtimeId, startTimeoutMs: execution?.startTimeoutMs },
+          "Codex CLI start timeout — process produced no output",
+        );
+        resolve({ result: null as unknown as RuntimeRunResult, startTimedOut: true });
+        return;
+      }
+
+      if (timeouts.runTimedOut) {
+        const runMs = execution?.runTimeoutMs ?? resolveTimeoutMs(input);
+        reject(makeProcessRunTimeoutError(runMs));
+        return;
+      }
+
+      if (code !== 0) {
+        const tail = state.outputText || state.plainTextFallback || "unknown error";
+        const message = `Codex CLI exited with code ${code}: ${stderr || tail}`;
+        reject(classifyCodexRuntimeError(message));
+        return;
+      }
+
+      try {
+        resolve({
+          result: finalizeCodexResult(state, input.sessionId ?? null),
+          startTimedOut: false,
+        });
+      } catch (error) {
+        reject(classifyCodexRuntimeError(error));
+      }
+    });
+  });
+}
+
+export async function runCodexCli(
+  input: RuntimeRunInput,
+  logger?: CodexCliLogger,
+): Promise<RuntimeRunResult> {
+  const cliPath = resolveCliPath(input);
+  // Compose once so the same prompt (systemPromptAppend + user prompt) is
+  // used for both template substitution in `codexCliArgs` and the stdin
+  // fallback — otherwise a custom `--prompt={prompt}` would silently drop
+  // the language directive the registry attached via `systemPromptAppend`.
+  const composedPrompt = composePrompt(input);
+  const { args, usesPromptPlaceholder } = normalizeCliArgs(input, composedPrompt, logger);
+  const options = asRecord(input.options);
+  const apiKeyEnvVar =
+    typeof options.apiKeyEnvVar === "string" ? options.apiKeyEnvVar : "OPENAI_API_KEY";
+  const curatedEnv = buildCuratedEnv(apiKeyEnvVar);
+  const env = curatedEnv.env;
+  logger?.debug?.(
+    {
+      runtimeId: input.runtimeId,
+      transport: "cli",
+      forwardedEnvCount: curatedEnv.forwardedCount,
+      filteredEnvCount: curatedEnv.filteredCount,
+      blockedEnvCount: curatedEnv.blockedCount,
+      droppedDisallowedPrefixCount: curatedEnv.droppedDisallowedPrefixKeys.length,
+    },
+    "[runtime:codex] Built Codex CLI environment from curated allowlist",
+  );
+  if (curatedEnv.droppedDisallowedPrefixKeys.length > 0) {
+    logger?.warn?.(
+      {
+        runtimeId: input.runtimeId,
+        transport: "cli",
+        droppedDisallowedPrefixKeys: curatedEnv.droppedDisallowedPrefixKeys.slice(0, 10),
+      },
+      "WARN [runtime:codex] Dropped disallowed environment prefix keys while building Codex CLI environment",
+    );
+  }
+
+  logger?.info?.(
+    {
+      runtimeId: input.runtimeId,
+      transport: "cli",
+      cliPath,
+      argCount: args.length,
+      startTimeoutMs: input.execution?.startTimeoutMs ?? null,
+      runTimeoutMs: input.execution?.runTimeoutMs ?? resolveTimeoutMs(input),
+    },
+    "Starting Codex CLI run",
+  );
+
+  const { result, startTimedOut } = await runCodexCliAttempt(
+    input,
+    cliPath,
+    args,
+    env,
+    composedPrompt,
+    usesPromptPlaceholder,
+    logger,
+  );
+
+  if (startTimedOut) {
+    const retryDelayMs = resolveRetryDelay(input.execution ?? {});
+    logger?.warn?.(
+      { runtimeId: input.runtimeId, retryDelayMs },
+      "Codex CLI start timeout, retrying once after delay",
+    );
+    await sleepMs(retryDelayMs);
+
+    const retry = await runCodexCliAttempt(
+      input,
+      cliPath,
+      args,
+      env,
+      composedPrompt,
+      usesPromptPlaceholder,
+      logger,
+    );
+    if (retry.startTimedOut) {
+      throw makeProcessStartTimeoutError(input.execution?.startTimeoutMs ?? 0);
+    }
+    return appendCodexSessionLimitEvent(input, retry.result);
+  }
+
+  return appendCodexSessionLimitEvent(input, result);
+}

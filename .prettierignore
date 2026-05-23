@@ -1,0 +1,11 @@
+dist/
+node_modules/
+coverage/
+data/
+.turbo/
+*.sqlite
+.ai-factory/
+docs-html/
+*SFConflict*
+playwright-report/
+test-results/

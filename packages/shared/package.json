@@ -1,0 +1,39 @@
+{
+  "name": "@aif/shared",
+  "version": "0.1.0",
+  "description": "Shared types, schema, database, and utilities for AIF Handoff",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./browser": "./src/browser.ts",
+    "./server": "./src/server.ts"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run --configLoader runner",
+    "coverage": "vitest run --coverage",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test:watch": "vitest --configLoader runner",
+    "predb:setup": "npm run build",
+    "db:setup": "node -e \"import('./dist/db.js').then((m) => { m.getDb(); m.closeDb(); })\"",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^17.3.1",
+    "drizzle-orm": "^0.45.2",
+    "pino": "^10.3.1",
+    "yaml": "^2.8.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.2"
+  }
+}

@@ -1,0 +1,898 @@
+import { EventEmitter } from "node:events";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getCliSpawnInvocation } from "./helpers/cliSpawn.js";
+import { TEST_USAGE_CONTEXT } from "./helpers/usageContext.js";
+
+const spawnMock = vi.fn();
+const mockGetCodexSessionLimitSnapshot = vi.fn();
+
+vi.mock("node:child_process", () => ({
+  spawn: (...args: unknown[]) => spawnMock(...args),
+}));
+
+vi.mock("../adapters/codex/sessions.js", () => ({
+  getCodexSessionLimitSnapshot: (...args: unknown[]) => mockGetCodexSessionLimitSnapshot(...args),
+}));
+
+const { runCodexCli } = await import("../adapters/codex/cli.js");
+
+interface MockChildProcess extends EventEmitter {
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+  stdin: EventEmitter & {
+    write: ReturnType<typeof vi.fn>;
+    end: ReturnType<typeof vi.fn>;
+  };
+  kill: ReturnType<typeof vi.fn>;
+}
+
+function createMockChildProcess(): MockChildProcess {
+  const child = new EventEmitter() as MockChildProcess;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  const stdinEmitter = new EventEmitter();
+  child.stdin = Object.assign(stdinEmitter, {
+    write: vi.fn(),
+    end: vi.fn(),
+  }) as MockChildProcess["stdin"];
+  child.kill = vi.fn();
+  return child;
+}
+
+function getSpawnInvocation() {
+  return getCliSpawnInvocation(spawnMock);
+}
+
+function createRunInput(overrides: Record<string, unknown> = {}) {
+  return {
+    runtimeId: "codex",
+    providerId: "openai",
+    profileId: "profile-1",
+    workflowKind: "implementer",
+    prompt: "Implement feature",
+    model: "gpt-5.4",
+    sessionId: "session-1",
+    options: {},
+    usageContext: TEST_USAGE_CONTEXT,
+    ...overrides,
+  };
+}
+
+describe("codex cli transport", () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+    mockGetCodexSessionLimitSnapshot.mockReset();
+    mockGetCodexSessionLimitSnapshot.mockResolvedValue(null);
+    vi.unstubAllEnvs();
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
+  it("runs codex cli with default args and passes prompt via stdin", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput());
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const { cliPath, cliArgs: args } = getSpawnInvocation();
+    expect(cliPath).toBe("codex");
+    expect(args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.4",
+      "-c",
+      'approval_policy="on-request"',
+      "-c",
+      'sandbox_mode="workspace-write"',
+    ]);
+    expect(child.stdin.write).toHaveBeenCalledWith("Implement feature");
+
+    child.stdout.emit("data", "plain output");
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.outputText).toBe("plain output");
+    expect(result.sessionId).toBe("session-1");
+    expect(result.raw).toBe("plain output");
+  });
+
+  it("prepends execution.systemPromptAppend to stdin prompt (no --system-prompt CLI flag)", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { systemPromptAppend: "Language policy: write in Russian." },
+      }),
+    );
+
+    expect(child.stdin.write).toHaveBeenCalledWith(
+      "Language policy: write in Russian.\n\nImplement feature",
+    );
+
+    child.stdout.emit("data", "plain output");
+    child.emit("close", 0);
+
+    await runPromise;
+  });
+
+  it("prepends execution.systemPromptAppend to resume stdin prompt (resume path)", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        resume: true,
+        sessionId: "thread-resume",
+        execution: { systemPromptAppend: "Language policy: write in Russian." },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args.slice(0, 3)).toEqual(["exec", "resume", "thread-resume"]);
+    expect(child.stdin.write).toHaveBeenCalledWith(
+      "Language policy: write in Russian.\n\nImplement feature",
+    );
+
+    child.stdout.emit("data", "resumed output");
+    child.emit("close", 0);
+
+    await runPromise;
+  });
+
+  it("injects systemPromptAppend into custom codexCliArgs {prompt} placeholder and skips stdin", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { systemPromptAppend: "Language policy: write in Russian." },
+        options: {
+          codexCliArgs: ["run", "--json", "--prompt={prompt}"],
+        },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toEqual([
+      "run",
+      "--json",
+      "--prompt=Language policy: write in Russian.\n\nImplement feature",
+    ]);
+    // Prompt was embedded via {prompt} → stdin must not receive it again.
+    expect(child.stdin.write).not.toHaveBeenCalled();
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+
+    await runPromise;
+  });
+
+  it("still writes prompt to stdin on default path when the prompt collides with a generic arg token", async () => {
+    // Regression: on the default path `args` always contain generic tokens
+    // like `exec`, `--json`, or the model id. A prompt that happens to equal
+    // one of those must NOT be treated as "already embedded" — otherwise the
+    // user's prompt would never reach the CLI. Only the explicit {prompt} /
+    // --prompt placeholder signals are allowed to suppress stdin.
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput({ prompt: "exec" }));
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toContain("exec");
+    expect(child.stdin.write).toHaveBeenCalledWith("exec");
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("skips stdin when {prompt} placeholder is embedded inside a composite arg", async () => {
+    // Guards against the edge case where `{prompt}` sits inside an arbitrary
+    // flag shape (e.g. `--payload=prefix {prompt} suffix`). The substitution
+    // consumes the literal `{prompt}` token, so the stdin suppressor must
+    // rely on a pre-substitution signal — otherwise the composed prompt would
+    // be delivered twice (once inside the arg, once via stdin).
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { systemPromptAppend: "Language policy: write in Russian." },
+        options: {
+          codexCliArgs: ["run", "--json", "--payload=prefix {prompt} suffix"],
+        },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toEqual([
+      "run",
+      "--json",
+      "--payload=prefix Language policy: write in Russian.\n\nImplement feature suffix",
+    ]);
+    expect(child.stdin.write).not.toHaveBeenCalled();
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+
+    await runPromise;
+  });
+
+  it("uses exec resume subcommand when resume and sessionId are set", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput({ resume: true, sessionId: "thread-abc" }));
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toEqual([
+      "exec",
+      "resume",
+      "thread-abc",
+      "--json",
+      "--model",
+      "gpt-5.4",
+      "-c",
+      'approval_policy="on-request"',
+      "-c",
+      'sandbox_mode="workspace-write"',
+    ]);
+    expect(child.stdin.write).toHaveBeenCalledWith("Implement feature");
+
+    child.stdout.emit("data", "resumed output");
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.outputText).toBe("resumed output");
+  });
+
+  it("supports cli args placeholders and parses JSON output", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    vi.stubEnv("OPENAI_API_KEY", "sk-test");
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        options: {
+          codexCliPath: "/usr/local/bin/codex",
+          codexCliArgs: [
+            "run",
+            "--json",
+            "--prompt={prompt}",
+            "--model={model}",
+            "--session={session_id}",
+          ],
+          apiKeyEnvVar: "OPENAI_API_KEY",
+        },
+      }),
+    );
+
+    const {
+      cliPath,
+      cliArgs: args,
+      spawnOptions,
+    } = getSpawnInvocation() as {
+      cliPath: string;
+      cliArgs: string[];
+      spawnOptions: { env?: Record<string, string> };
+    };
+    expect(cliPath).toBe("/usr/local/bin/codex");
+    expect(args).toEqual([
+      "run",
+      "--json",
+      "--prompt=Implement feature",
+      "--model=gpt-5.4",
+      "--session=session-1",
+    ]);
+    expect(spawnOptions.env?.OPENAI_API_KEY).toBe("sk-test");
+    expect(child.stdin.write).not.toHaveBeenCalled();
+
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        outputText: "json output",
+        sessionId: "session-2",
+        usage: { inputTokens: 12, outputTokens: 8, costUsd: 0.3 },
+        events: [{ type: "stream:text", message: "delta" }],
+      }),
+    );
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.outputText).toBe("json output");
+    expect(result.sessionId).toBe("session-2");
+    expect(result.usage).toEqual({
+      inputTokens: 12,
+      outputTokens: 8,
+      totalTokens: 20,
+      costUsd: 0.3,
+    });
+    expect(result.events?.[0]?.type).toBe("stream:text");
+  });
+
+  it("expands multiple placeholders within one custom arg and suppresses stdin", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        options: {
+          codexCliArgs: [
+            "run",
+            "--json",
+            "--meta={model}:{session_id}",
+            "--prompt={prompt} ({model})",
+          ],
+        },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toEqual([
+      "run",
+      "--json",
+      "--meta=gpt-5.4:session-1",
+      "--prompt=Implement feature (gpt-5.4)",
+    ]);
+    expect(child.stdin.write).not.toHaveBeenCalled();
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.outputText).toBe("ok");
+  });
+
+  it("emits -c approval_policy and -c sandbox_mode defaults when execution.bypassPermissions is true", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput({ execution: { bypassPermissions: true } }));
+
+    const { cliArgs: args } = getSpawnInvocation();
+    const approvalIdx = args.indexOf('approval_policy="never"');
+    expect(approvalIdx).toBeGreaterThan(0);
+    expect(args[approvalIdx - 1]).toBe("-c");
+    const sandboxIdx = args.indexOf('sandbox_mode="danger-full-access"');
+    expect(sandboxIdx).toBeGreaterThan(0);
+    expect(args[sandboxIdx - 1]).toBe("-c");
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("emits stable non-bypass defaults (on-request + workspace-write) when bypassPermissions is absent", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput());
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toContain('approval_policy="on-request"');
+    expect(args).toContain('sandbox_mode="workspace-write"');
+    expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("lets explicit profile options.sandboxMode override the bypass default", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { bypassPermissions: true },
+        options: { sandboxMode: "workspace-write" },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toContain('approval_policy="never"'); // bypass still applies to approval
+    expect(args).toContain('sandbox_mode="workspace-write"');
+    expect(args).not.toContain('sandbox_mode="danger-full-access"');
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("reads options.approvalPolicy override while keeping sandbox at non-bypass default", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        options: { approvalPolicy: "on-failure" },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toContain('approval_policy="on-failure"');
+    // Sandbox was not explicitly set → stable non-bypass default kicks in
+    expect(args).toContain('sandbox_mode="workspace-write"');
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("warns and falls back to defaults when permission overrides are invalid", async () => {
+    const child = createMockChildProcess();
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        options: { approvalPolicy: "bad-policy", sandboxMode: "bad-sandbox" },
+      }),
+      logger,
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toContain('approval_policy="on-request"');
+    expect(args).toContain('sandbox_mode="workspace-write"');
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeId: "codex",
+        transport: "cli",
+        field: "approvalPolicy",
+        invalidValue: "bad-policy",
+      }),
+      "Ignoring invalid Codex approvalPolicy override",
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeId: "codex",
+        transport: "cli",
+        field: "sandboxMode",
+        invalidValue: "bad-sandbox",
+      }),
+      "Ignoring invalid Codex sandboxMode override",
+    );
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeId: "codex",
+        transport: "cli",
+        approvalPolicy: "on-request",
+        sandboxMode: "workspace-write",
+      }),
+      "Resolved Codex CLI approval and sandbox settings",
+    );
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("custom codexCliArgs is a full escape hatch — adapter-managed flags are NOT injected", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { bypassPermissions: true },
+        options: {
+          codexCliArgs: ["run", "--json", "--prompt={prompt}"],
+        },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args.some((arg) => arg.startsWith("approval_policy="))).toBe(false);
+    expect(args.some((arg) => arg.startsWith("sandbox_mode="))).toBe(false);
+    expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(args).toEqual(["run", "--json", "--prompt=Implement feature"]);
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("appends --skip-git-repo-check when options.skipGitRepoCheck is true", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput({ options: { skipGitRepoCheck: true } }));
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toContain("--skip-git-repo-check");
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("throws classified error when CLI exits with non-zero code", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput());
+    child.stderr.emit("data", "unauthorized");
+    child.emit("close", 1);
+
+    await expect(runPromise).rejects.toMatchObject({
+      name: "CodexRuntimeAdapterError",
+      adapterCode: "CODEX_AUTH_ERROR",
+    });
+  });
+
+  it("throws classified error when spawn emits error", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput());
+    child.emit("error", new Error("spawn ENOENT"));
+
+    await expect(runPromise).rejects.toMatchObject({
+      name: "CodexRuntimeAdapterError",
+      adapterCode: "CODEX_CLI_NOT_FOUND",
+    });
+  });
+
+  it("excludes OPENAI_BASE_URL from child env to prevent deprecated endpoint override", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    vi.stubEnv("OPENAI_API_KEY", "sk-test");
+    vi.stubEnv("OPENAI_BASE_URL", "https://api.openai.com/v1");
+    vi.stubEnv("npm_config_registry", "https://registry.npmjs.org");
+
+    const runPromise = runCodexCli(createRunInput());
+
+    const [, , spawnOptions] = spawnMock.mock.calls[0] as [
+      string,
+      string[],
+      { env?: Record<string, string> },
+    ];
+    expect(spawnOptions.env?.OPENAI_API_KEY).toBe("sk-test");
+    expect(spawnOptions.env?.OPENAI_BASE_URL).toBeUndefined();
+    expect(spawnOptions.env?.npm_config_registry).toBeUndefined();
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("kills process and throws timeout error when run exceeds timeout", async () => {
+    vi.useFakeTimers();
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { runTimeoutMs: 5 },
+      }),
+    );
+
+    vi.advanceTimersByTime(5);
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    child.emit("close", 0);
+
+    await expect(runPromise).rejects.toMatchObject({
+      name: "RuntimeExecutionError",
+      category: "timeout",
+    });
+  });
+
+  it("retries once after start timeout and succeeds on second attempt", async () => {
+    vi.useFakeTimers();
+    const child1 = createMockChildProcess();
+    const child2 = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child1).mockReturnValueOnce(child2);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { startTimeoutMs: 10, startRetryDelayMs: 0, runTimeoutMs: 60_000 },
+      }),
+    );
+
+    // First attempt: no output → start timeout fires
+    vi.advanceTimersByTime(10);
+    expect(child1.kill).toHaveBeenCalledWith("SIGKILL");
+    child1.emit("close", null);
+
+    // Let async close handler + retry settle
+    await vi.advanceTimersByTimeAsync(1);
+
+    // Second attempt succeeds
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    child2.stdout.emit("data", "retry output");
+    child2.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.outputText).toBe("retry output");
+  });
+
+  it("throws start timeout error when both attempts time out", async () => {
+    vi.useFakeTimers();
+    const child1 = createMockChildProcess();
+    const child2 = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child1).mockReturnValueOnce(child2);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { startTimeoutMs: 10, startRetryDelayMs: 0, runTimeoutMs: 60_000 },
+      }),
+    );
+
+    // First attempt: start timeout
+    vi.advanceTimersByTime(10);
+    child1.emit("close", null);
+    await vi.advanceTimersByTimeAsync(1);
+
+    // Second attempt: also times out
+    vi.advanceTimersByTime(10);
+    child2.emit("close", null);
+
+    await expect(runPromise).rejects.toMatchObject({
+      name: "RuntimeExecutionError",
+      category: "timeout",
+      message: expect.stringContaining("Start timeout"),
+    });
+  });
+
+  it("captures thread_id, accumulates agent_message text, and fires stream:text events", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const onEvent = vi.fn();
+    const runPromise = runCodexCli(createRunInput({ execution: { onEvent } }));
+
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "thread.started",
+        thread_id: "019d76a3-f039-7472-81de-7ffb0759542c",
+      }) + "\n",
+    );
+    child.stdout.emit("data", JSON.stringify({ type: "turn.started" }) + "\n");
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "item_0", type: "agent_message", text: "Hello " },
+      }) + "\n",
+    );
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "item_1", type: "agent_message", text: "world" },
+      }) + "\n",
+    );
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 5 },
+      }) + "\n",
+    );
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.sessionId).toBe("019d76a3-f039-7472-81de-7ffb0759542c");
+    expect(result.outputText).toBe("Hello \n\nworld");
+    expect(result.usage).toMatchObject({
+      inputTokens: 120,
+      outputTokens: 5,
+      totalTokens: 125,
+    });
+
+    const streamTextEvents = onEvent.mock.calls
+      .map((c) => c[0] as { type: string; message?: string })
+      .filter((e) => e.type === "stream:text");
+    expect(streamTextEvents).toHaveLength(2);
+    expect(streamTextEvents[0]?.message).toBe("Hello ");
+    expect(streamTextEvents[1]?.message).toBe("world");
+
+    const initEvents = onEvent.mock.calls
+      .map((c) => c[0] as { type: string })
+      .filter((e) => e.type === "system:init");
+    expect(initEvents).toHaveLength(1);
+  });
+
+  it("appends a runtime:limit event when the Codex session store reports quota windows", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+    mockGetCodexSessionLimitSnapshot.mockResolvedValue({
+      source: "sdk_event",
+      status: "warning",
+      precision: "exact",
+      checkedAt: "2026-04-18T05:00:00.000Z",
+      providerId: "openai",
+      runtimeId: "codex",
+      profileId: "profile-1",
+      primaryScope: "time",
+      resetAt: "2099-04-18T10:00:00.000Z",
+      retryAfterSeconds: null,
+      warningThreshold: 10,
+      windows: [
+        {
+          scope: "time",
+          name: "5h",
+          percentUsed: 92,
+          percentRemaining: 8,
+          resetAt: "2099-04-18T10:00:00.000Z",
+          warningThreshold: 10,
+        },
+      ],
+      providerMeta: {
+        limitId: "codex",
+        limitName: null,
+        planType: "pro",
+      },
+    });
+
+    const onEvent = vi.fn();
+    const runPromise = runCodexCli(createRunInput({ execution: { onEvent } }));
+
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "thread.started",
+        thread_id: "thread-quota-1",
+      }) + "\n",
+    );
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 50, output_tokens: 10 },
+      }) + "\n",
+    );
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(mockGetCodexSessionLimitSnapshot).toHaveBeenCalledWith({
+      sessionId: "thread-quota-1",
+      runtimeId: "codex",
+      providerId: "openai",
+      profileId: "profile-1",
+    });
+    expect(result.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "runtime:limit",
+          message: "Runtime limit state changed: warning",
+        }),
+      ]),
+    );
+    expect(result.events?.filter((event) => event.type === "runtime:limit")).toHaveLength(1);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "runtime:limit",
+        message: "Runtime limit state changed: warning",
+      }),
+    );
+  });
+
+  it("emits tool:use and calls onToolUse for command_execution items", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const onToolUse = vi.fn();
+    const onEvent = vi.fn();
+    const runPromise = runCodexCli(createRunInput({ execution: { onToolUse, onEvent } }));
+
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "thread.started",
+        thread_id: "thread-tool-1",
+      }) + "\n",
+    );
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "item.started",
+        item: {
+          id: "item_1",
+          type: "command_execution",
+          command: "/bin/zsh -lc ls",
+          status: "in_progress",
+        },
+      }) + "\n",
+    );
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          id: "item_1",
+          type: "command_execution",
+          command: "/bin/zsh -lc ls",
+          aggregated_output: "file1\nfile2",
+          exit_code: 0,
+          status: "completed",
+        },
+      }) + "\n",
+    );
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "item_2", type: "agent_message", text: "Listed files." },
+      }) + "\n",
+    );
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 50, output_tokens: 10 },
+      }) + "\n",
+    );
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.outputText).toBe("Listed files.");
+
+    // Tool use triggered once on item.started, NOT re-emitted on item.completed
+    expect(onToolUse).toHaveBeenCalledTimes(1);
+    const [toolName, detail] = onToolUse.mock.calls[0];
+    expect(toolName).toBe("Bash");
+    expect(detail).toContain("ls");
+
+    const toolEvents = onEvent.mock.calls
+      .map((c) => c[0] as { type: string; data?: { name?: string } })
+      .filter((e) => e.type === "tool:use");
+    expect(toolEvents).toHaveLength(1);
+    expect(toolEvents[0]?.data?.name).toBe("Bash");
+  });
+
+  it("handles JSONL lines split across multiple stdout chunks", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput());
+
+    // Split a single JSON line across two chunks to exercise the line buffer
+    const line1 = JSON.stringify({
+      type: "thread.started",
+      thread_id: "thread-split",
+    });
+    child.stdout.emit("data", line1.slice(0, 20));
+    child.stdout.emit("data", line1.slice(20) + "\n");
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "item_0", type: "agent_message", text: "ok" },
+      }) + "\n",
+    );
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.sessionId).toBe("thread-split");
+    expect(result.outputText).toBe("ok");
+  });
+
+  it("falls back to plain text when stdout is not JSONL", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput());
+    child.stdout.emit("data", "not json at all");
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.outputText).toBe("not json at all");
+    expect(result.raw).toBe("not json at all");
+  });
+});

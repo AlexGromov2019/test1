@@ -1,0 +1,855 @@
+import { spawn, execFileSync } from "node:child_process";
+import type {
+  RuntimeEvent,
+  RuntimeLimitSnapshot,
+  RuntimeRunInput,
+  RuntimeSessionForkInput,
+  RuntimeRunResult,
+  RuntimeUsage,
+} from "../../types.js";
+import { RuntimeLimitStatus } from "../../types.js";
+import { buildRuntimeLimitEvent } from "../../limitEvents.js";
+import { assertSafeWindowsShellExecutablePath } from "../../shellSafety.js";
+import {
+  makeProcessRunTimeoutError,
+  makeProcessStartTimeoutError,
+  resolveRetryDelay,
+  sleepMs,
+  withProcessTimeouts,
+} from "../../timeouts.js";
+import { classifyClaudeResultSubtype, classifyClaudeRuntimeError } from "./errors.js";
+import { normalizeClaudeLimitSnapshot } from "./limit.js";
+import { normalizeClaudeEffort, resolveProfileEnvironment } from "./options.js";
+import { buildToolUseEvents } from "../../toolEvents.js";
+import { parseClaudeAskUserQuestion } from "./questions.js";
+import type { ClaudeProviderIdentity } from "./providerIdentity.js";
+import { resolveClaudeProviderAuth } from "./providerIdentity.js";
+import { fetchZaiClaudeQuotaSnapshot } from "./zaiQuota.js";
+
+const IS_WINDOWS = process.platform === "win32";
+
+export interface ClaudeCliLogger {
+  debug?(context: Record<string, unknown>, message: string): void;
+  info?(context: Record<string, unknown>, message: string): void;
+  warn?(context: Record<string, unknown>, message: string): void;
+  error?(context: Record<string, unknown>, message: string): void;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function readForkSourceSessionId(input: RuntimeRunInput): string | null {
+  const sourceSessionId = (input as Partial<RuntimeSessionForkInput>).sourceSessionId;
+  return typeof sourceSessionId === "string" && sourceSessionId.trim().length > 0
+    ? sourceSessionId.trim()
+    : null;
+}
+
+const ALLOWED_ENV_PREFIXES = [
+  "ANTHROPIC_",
+  "OPENAI_",
+  "CLAUDE_",
+  "AIF_",
+  "HANDOFF_",
+  "NODE_",
+  "npm_",
+  "HOME",
+  "USER",
+  "LANG",
+  "LC_",
+  "PATH",
+  "SHELL",
+  "TERM",
+  "TMPDIR",
+  "TZ",
+  "XDG_",
+  "EDITOR",
+  "VISUAL",
+  "FORCE_COLOR",
+  "NO_COLOR",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+];
+
+function buildCuratedEnv(
+  apiKeyEnvVar: string,
+  executionEnv?: Record<string, string>,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value == null) continue;
+    if (
+      key === apiKeyEnvVar ||
+      ALLOWED_ENV_PREFIXES.some((prefix) => key === prefix || key.startsWith(prefix))
+    ) {
+      env[key] = value;
+    }
+  }
+  Object.assign(env, executionEnv ?? {});
+  return env;
+}
+
+function resolveCliPath(input: RuntimeRunInput, adapterDefault?: string): string {
+  const options = asRecord(input.options);
+  return (
+    readString(options.claudeCliPath) ??
+    readString(process.env.CLAUDE_CLI_PATH) ??
+    adapterDefault ??
+    "claude"
+  );
+}
+
+/**
+ * Probe whether the Claude CLI is actually reachable by running `claude --version`.
+ * On Windows bare command names like `"claude"` need `shell: true` to resolve `.cmd`.
+ */
+export function probeClaudeCli(cliPath: string): { ok: boolean; version?: string; error?: string } {
+  try {
+    if (IS_WINDOWS) {
+      assertSafeWindowsShellExecutablePath(cliPath, "Claude CLI path");
+    }
+    const out = execFileSync(cliPath, ["--version"], {
+      timeout: 5_000,
+      shell: IS_WINDOWS,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return { ok: true, version: out.toString().trim() };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: message };
+  }
+}
+
+/* v8 ignore start -- Windows-only spawn logic, untestable in macOS/Linux CI */
+function quoteIfNeeded(arg: string): string {
+  return arg.includes(" ") || arg.includes('"') ? `"${arg.replace(/"/g, '\\"')}"` : arg;
+}
+
+function spawnCliWindows(
+  cliPath: string,
+  args: string[],
+  cwd: string | undefined,
+  env: Record<string, string>,
+) {
+  assertSafeWindowsShellExecutablePath(cliPath, "Claude CLI path");
+  const cmd = process.env.ComSpec ?? "cmd.exe";
+  const cmdLine = [cliPath, ...args.map(quoteIfNeeded)].join(" ");
+  return spawn(cmd, ["/d", "/c", cmdLine], {
+    cwd,
+    env,
+    stdio: "pipe",
+    windowsVerbatimArguments: true,
+  });
+}
+/* v8 ignore stop */
+
+function resolveTimeoutMs(input: RuntimeRunInput): number {
+  const exec = input.execution;
+  if (
+    typeof exec?.runTimeoutMs === "number" &&
+    Number.isFinite(exec.runTimeoutMs) &&
+    exec.runTimeoutMs > 0
+  ) {
+    return Math.floor(exec.runTimeoutMs);
+  }
+  return 300_000;
+}
+
+/**
+ * Build CLI args for the `claude` binary.
+ *
+ * Agent mode:  `claude --agent <name> --output-format stream-json --verbose -p`
+ * Direct mode: `claude --output-format stream-json --verbose -p`
+ *
+ * The prompt itself is NOT passed on the command line — it is written to the
+ * child's stdin in `runCliAttempt`. This keeps the prompt off argv so we do
+ * not hit ARG_MAX / cmd.exe command-line limits on large prompts (rework
+ * headers, full plans, task attachments can easily reach 100+ KB).
+ *
+ * stream-json is used instead of json so the CLI emits JSONL events as they
+ * happen — text chunks, tool_use, session init — giving the runtime a live
+ * feed of Agent Activity (onEvent/onToolUse callbacks) rather than a single
+ * buffered blob at exit. --verbose is a hard requirement for the CLI to
+ * actually stream intermediate events in stream-json mode.
+ */
+function buildCliArgs(input: RuntimeRunInput): string[] {
+  const execution = input.execution;
+  const options = asRecord(input.options);
+  const args: string[] = [];
+
+  // Agent definition — spawns subagent via --agent flag
+  const agentName = execution?.agentDefinitionName ?? readString(options.agentDefinitionName);
+  if (agentName) {
+    args.push("--agent", agentName);
+  }
+
+  // Streaming JSONL output (required to surface Agent Activity in real time)
+  args.push("--output-format", "stream-json", "--verbose");
+
+  // Opt-in token-level deltas (only works with --print + stream-json)
+  if (execution?.includePartialMessages) {
+    args.push("--include-partial-messages");
+  }
+
+  // Model override
+  if (input.model) {
+    args.push("--model", input.model);
+  }
+
+  // Effort level (low, medium, high, max)
+  const effort = normalizeClaudeEffort(options.effort);
+  if (effort) {
+    args.push("--effort", effort);
+  }
+
+  // Max turns
+  if (execution?.maxTurns) {
+    args.push("--max-turns", String(execution.maxTurns));
+  }
+
+  const forkSourceSessionId = readForkSourceSessionId(input);
+  if (forkSourceSessionId) {
+    args.push("--resume", forkSourceSessionId, "--fork-session");
+  } else if (input.resume && input.sessionId) {
+    args.push("--resume", input.sessionId);
+  }
+
+  // System prompt append
+  const systemAppend = execution?.systemPromptAppend ?? readString(options.systemPromptAppend);
+  if (systemAppend) {
+    args.push("--append-system-prompt", systemAppend);
+  }
+
+  // Permission mode
+  if (execution?.bypassPermissions) {
+    args.push("--dangerously-skip-permissions");
+  } else {
+    args.push("--permission-mode", "acceptEdits");
+  }
+
+  // Non-interactive print mode — prompt itself is piped through stdin below.
+  args.push("-p");
+
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// stream-json line processor
+// ---------------------------------------------------------------------------
+
+interface StreamJsonContentItem {
+  type?: string;
+  text?: string;
+  name?: string;
+  id?: string;
+  input?: unknown;
+  thinking?: string;
+}
+
+interface StreamJsonMessage {
+  type?: string;
+  subtype?: string;
+  session_id?: string;
+  is_error?: boolean;
+  result?: string;
+  rate_limit_info?: unknown;
+  total_cost_usd?: number;
+  cost_usd?: number;
+  duration_ms?: number;
+  duration_api_ms?: number;
+  num_turns?: number;
+  message?: {
+    content?: StreamJsonContentItem[];
+  };
+  event?: {
+    type?: string;
+    delta?: { type?: string; text?: string };
+  };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+}
+
+interface ClaudeCliStreamState {
+  sessionId: string | null;
+  outputText: string;
+  assistantText: string;
+  usage: RuntimeUsage | null;
+  latestLimitSnapshot: RuntimeLimitSnapshot | null;
+  events: RuntimeEvent[];
+  terminalErrorSubtype: string | null;
+  terminalErrorDetail: string | null;
+  plainTextFallback: string;
+}
+
+function createCliStreamState(fallbackSessionId: string | null): ClaudeCliStreamState {
+  return {
+    sessionId: fallbackSessionId,
+    outputText: "",
+    assistantText: "",
+    usage: null,
+    latestLimitSnapshot: null,
+    events: [],
+    terminalErrorSubtype: null,
+    terminalErrorDetail: null,
+    plainTextFallback: "",
+  };
+}
+
+function summarizeToolInput(input: unknown): string {
+  if (input == null) return "";
+  if (typeof input === "string") {
+    return input.length > 80 ? `${input.slice(0, 77)}...` : input;
+  }
+  try {
+    const json = JSON.stringify(input);
+    if (json.length <= 100) return json;
+    return `${json.slice(0, 97)}...`;
+  } catch {
+    return "";
+  }
+}
+
+function normalizeStreamJsonUsage(message: StreamJsonMessage): RuntimeUsage | null {
+  const usage = message.usage;
+  if (!usage) return null;
+  const rawInput = usage.input_tokens ?? 0;
+  const cacheCreation = usage.cache_creation_input_tokens ?? 0;
+  const cacheRead = usage.cache_read_input_tokens ?? 0;
+  const inputTokens = rawInput + cacheCreation + cacheRead;
+  const outputTokens = usage.output_tokens ?? 0;
+  const totalTokens = usage.total_tokens ?? inputTokens + outputTokens;
+  const costUsdRaw = message.total_cost_usd ?? message.cost_usd;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    costUsd: typeof costUsdRaw === "number" ? costUsdRaw : undefined,
+  };
+}
+
+function emitEvent(
+  state: ClaudeCliStreamState,
+  execution: RuntimeRunInput["execution"],
+  event: RuntimeEvent,
+): void {
+  state.events.push(event);
+  execution?.onEvent?.(event);
+}
+
+function buildClaudeLimitErrorMetadata(snapshot: RuntimeLimitSnapshot | null) {
+  const retryAfterSeconds = snapshot?.retryAfterSeconds ?? null;
+  return {
+    resetAt: snapshot?.resetAt ?? null,
+    retryAfterSeconds,
+    retryAfterMs: retryAfterSeconds != null ? retryAfterSeconds * 1000 : null,
+    limitSnapshot: snapshot,
+    providerMeta: snapshot?.providerMeta ?? null,
+  };
+}
+
+function processStreamJsonLine(
+  line: string,
+  state: ClaudeCliStreamState,
+  input: RuntimeRunInput,
+  providerIdentity: ClaudeProviderIdentity,
+  logger?: ClaudeCliLogger,
+): void {
+  const execution = input.execution;
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  let message: StreamJsonMessage;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      state.plainTextFallback += (state.plainTextFallback ? "\n" : "") + trimmed;
+      return;
+    }
+    message = parsed as StreamJsonMessage;
+  } catch {
+    state.plainTextFallback += (state.plainTextFallback ? "\n" : "") + trimmed;
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+
+  if (message.type === "system" && message.subtype === "init") {
+    if (typeof message.session_id === "string" && message.session_id.length > 0) {
+      state.sessionId = message.session_id;
+    }
+    emitEvent(state, execution, {
+      type: "system:init",
+      timestamp: nowIso,
+      level: "debug",
+      message: "Runtime session initialized",
+      data: { sessionId: state.sessionId },
+    });
+    return;
+  }
+
+  if (message.type === "rate_limit_event") {
+    const snapshot = normalizeClaudeLimitSnapshot({
+      info: message.rate_limit_info,
+      runtimeId: input.runtimeId,
+      providerId: input.providerId ?? "anthropic",
+      profileId: input.profileId ?? null,
+      checkedAt: nowIso,
+      providerIdentity,
+    });
+
+    if (!snapshot) {
+      logger?.warn?.(
+        {
+          runtimeId: input.runtimeId,
+          providerId: input.providerId ?? "anthropic",
+          profileId: input.profileId ?? null,
+        },
+        "Dropped Claude rate_limit_event because it did not contain usable limit metadata",
+      );
+      return;
+    }
+
+    state.latestLimitSnapshot = snapshot;
+    emitEvent(state, execution, buildRuntimeLimitEvent(snapshot, "rate_limit_event"));
+    logger?.debug?.(
+      {
+        runtimeId: input.runtimeId,
+        providerId: snapshot.providerId,
+        profileId: snapshot.profileId ?? null,
+        status: snapshot.status,
+        precision: snapshot.precision,
+        source: snapshot.source,
+        resetAt: snapshot.resetAt ?? null,
+      },
+      "Translated Claude rate_limit_event into runtime limit snapshot",
+    );
+    if (snapshot.status === RuntimeLimitStatus.BLOCKED) {
+      throw classifyClaudeResultSubtype(
+        "rate_limit",
+        "Claude runtime reported a blocked limit state",
+        buildClaudeLimitErrorMetadata(snapshot),
+      );
+    }
+    return;
+  }
+
+  if (message.type === "assistant") {
+    if (typeof message.session_id === "string" && !state.sessionId) {
+      state.sessionId = message.session_id;
+    }
+    const content = message.message?.content;
+    // When --include-partial-messages is on, Claude emits BOTH token-level
+    // deltas (stream_event.content_block_delta.text_delta) AND the complete
+    // assistant content block once it finishes. Emitting stream:text from
+    // both sources would deliver the full text twice to callbacks that
+    // concatenate (e.g. chat:token → fullAssistantResponse in the chat
+    // route), so in partial-messages mode we only accumulate the full text
+    // for fallback and rely on deltas for the live event stream.
+    const partialMode = Boolean(execution?.includePartialMessages);
+    if (Array.isArray(content)) {
+      for (const item of content) {
+        if (!item || typeof item !== "object") continue;
+        if (item.type === "text" && typeof item.text === "string") {
+          state.assistantText += item.text;
+          if (!partialMode) {
+            emitEvent(state, execution, {
+              type: "stream:text",
+              timestamp: nowIso,
+              level: "debug",
+              message: item.text,
+              data: { text: item.text },
+            });
+          }
+        } else if (item.type === "tool_use" && typeof item.name === "string") {
+          const summary = summarizeToolInput(item.input);
+          const detailSuffix = summary ? ` ${summary}` : "";
+          const toolUseId = typeof item.id === "string" ? item.id : null;
+          for (const event of buildToolUseEvents({
+            toolName: item.name,
+            toolUseId,
+            input: item.input,
+            timestamp: nowIso,
+            detailSuffix,
+            questionPayload: parseClaudeAskUserQuestion(item.name, toolUseId, item.input),
+          })) {
+            emitEvent(state, execution, event);
+          }
+          execution?.onToolUse?.(item.name, detailSuffix);
+        }
+      }
+    }
+    return;
+  }
+
+  if (message.type === "stream_event") {
+    const delta = message.event?.delta;
+    if (
+      message.event?.type === "content_block_delta" &&
+      delta?.type === "text_delta" &&
+      typeof delta.text === "string"
+    ) {
+      state.outputText += delta.text;
+      emitEvent(state, execution, {
+        type: "stream:text",
+        timestamp: nowIso,
+        level: "debug",
+        message: delta.text,
+        data: { text: delta.text },
+      });
+    }
+    return;
+  }
+
+  if (message.type === "result") {
+    state.usage = normalizeStreamJsonUsage(message);
+    if (typeof message.session_id === "string") {
+      state.sessionId = message.session_id;
+    }
+    const directResult = typeof message.result === "string" ? message.result : "";
+    const subtype = message.subtype ?? "unknown";
+    const isError = subtype !== "success" || message.is_error === true;
+
+    if (isError) {
+      state.terminalErrorSubtype = subtype;
+      state.terminalErrorDetail = directResult || null;
+      emitEvent(state, execution, {
+        type: `result:${subtype}`,
+        timestamp: nowIso,
+        level: "error",
+        message: `Query ended with subtype ${subtype}`,
+        data: { subtype },
+      });
+      return;
+    }
+
+    // Success — finalize outputText. Prefer partial-message deltas, then
+    // accumulated assistant text, then the final `result` field.
+    if (!state.outputText) {
+      state.outputText = state.assistantText || directResult;
+    }
+    emitEvent(state, execution, {
+      type: "result:success",
+      timestamp: nowIso,
+      level: "info",
+      message: "CLI execution completed",
+      data: {
+        numTurns: message.num_turns,
+        durationMs: message.duration_ms,
+      },
+    });
+    return;
+  }
+
+  // Other message types (rate_limit_event, etc.) — not surfaced.
+}
+
+function finalizeCliResult(
+  state: ClaudeCliStreamState,
+  fallbackSessionId: string | null,
+): RuntimeRunResult {
+  const outputText =
+    state.outputText || state.assistantText || state.plainTextFallback.trim() || "";
+  return {
+    outputText,
+    sessionId: state.sessionId ?? fallbackSessionId,
+    usage: state.usage,
+    events: state.events,
+  };
+}
+
+function spawnCliProcess(
+  input: RuntimeRunInput,
+  cliPath: string,
+  args: string[],
+  env: Record<string, string>,
+): ReturnType<typeof spawn> {
+  /* v8 ignore next 2 -- Windows branch */
+  return IS_WINDOWS
+    ? spawnCliWindows(cliPath, args, input.cwd ?? input.projectRoot, env)
+    : spawn(cliPath, args, { cwd: input.cwd ?? input.projectRoot, env, stdio: "pipe" });
+}
+
+function runCliAttempt(
+  input: RuntimeRunInput,
+  cliPath: string,
+  args: string[],
+  env: Record<string, string>,
+  providerIdentity: ClaudeProviderIdentity,
+  authToken: string | null,
+  logger?: ClaudeCliLogger,
+): Promise<{ result: RuntimeRunResult; startTimedOut: boolean }> {
+  const execution = input.execution;
+  const child = spawnCliProcess(input, cliPath, args, env);
+
+  // Attach shared timeout utilities
+  const timeouts = withProcessTimeouts(child, {
+    startTimeoutMs: execution?.startTimeoutMs,
+    runTimeoutMs: execution?.runTimeoutMs ?? resolveTimeoutMs(input),
+  });
+
+  const fallbackSessionId = readForkSourceSessionId(input) ? null : (input.sessionId ?? null);
+  const state = createCliStreamState(fallbackSessionId);
+  let stdoutBuffer = "";
+  let stderr = "";
+  let streamProcessingError: unknown = null;
+
+  const flushCompleteLines = (): void => {
+    let newlineIdx = stdoutBuffer.indexOf("\n");
+    while (newlineIdx !== -1) {
+      const line = stdoutBuffer.slice(0, newlineIdx);
+      stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
+      processStreamJsonLine(line, state, input, providerIdentity, logger);
+      newlineIdx = stdoutBuffer.indexOf("\n");
+    }
+  };
+
+  child.stdout!.on("data", (chunk: Buffer | string) => {
+    stdoutBuffer += String(chunk);
+    try {
+      flushCompleteLines();
+    } catch (err) {
+      streamProcessingError = err;
+      logger?.error?.(
+        { runtimeId: input.runtimeId, err },
+        "Claude CLI stream-json processing error",
+      );
+      child.kill("SIGTERM");
+    }
+  });
+
+  child.stderr!.on("data", (chunk: Buffer | string) => {
+    const text = String(chunk);
+    stderr += text;
+    execution?.onStderr?.(text);
+  });
+
+  // Prompt is streamed via stdin so it never lands on argv (ARG_MAX /
+  // cmd.exe command-line limits would clip large rework/plan prompts).
+  // Swallow EPIPE — the child may exit before the full prompt is flushed.
+  child.stdin!.on("error", () => {
+    /* ignore broken-pipe */
+  });
+  child.stdin!.write(input.prompt);
+  child.stdin!.end();
+
+  // If abort is requested, kill the child
+  if (execution?.abortController) {
+    execution.abortController.signal.addEventListener(
+      "abort",
+      () => {
+        child.kill("SIGTERM");
+      },
+      { once: true },
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    child.on("error", (error) => {
+      timeouts.cleanup();
+      reject(
+        classifyClaudeRuntimeError(
+          error,
+          undefined,
+          buildClaudeLimitErrorMetadata(state.latestLimitSnapshot),
+        ),
+      );
+    });
+
+    child.on("close", async (code) => {
+      timeouts.cleanup();
+
+      // Flush any trailing buffer content as a final line.
+      if (stdoutBuffer.length > 0) {
+        try {
+          processStreamJsonLine(stdoutBuffer, state, input, providerIdentity, logger);
+        } catch {
+          /* ignore tail processing errors */
+        }
+        stdoutBuffer = "";
+      }
+
+      const startTimedOut = await timeouts.startTimedOut;
+
+      if (streamProcessingError) {
+        reject(
+          classifyClaudeRuntimeError(
+            streamProcessingError,
+            undefined,
+            buildClaudeLimitErrorMetadata(state.latestLimitSnapshot),
+          ),
+        );
+        return;
+      }
+
+      if (startTimedOut) {
+        const startMs = execution?.startTimeoutMs ?? 0;
+        logger?.warn?.(
+          { runtimeId: input.runtimeId, startTimeoutMs: startMs },
+          "Claude CLI start timeout — process produced no output",
+        );
+        resolve({ result: null as unknown as RuntimeRunResult, startTimedOut: true });
+        return;
+      }
+
+      if (timeouts.runTimedOut) {
+        const runMs = execution?.runTimeoutMs ?? resolveTimeoutMs(input);
+        reject(makeProcessRunTimeoutError(runMs));
+        return;
+      }
+
+      if (code !== 0) {
+        const message = `Claude CLI exited with code ${code}: ${stderr || state.outputText || state.plainTextFallback || "unknown error"}`;
+        reject(
+          classifyClaudeRuntimeError(
+            message,
+            undefined,
+            buildClaudeLimitErrorMetadata(state.latestLimitSnapshot),
+          ),
+        );
+        return;
+      }
+
+      if (state.terminalErrorSubtype) {
+        reject(
+          classifyClaudeResultSubtype(
+            state.terminalErrorSubtype,
+            state.terminalErrorDetail,
+            buildClaudeLimitErrorMetadata(state.latestLimitSnapshot),
+          ),
+        );
+        return;
+      }
+
+      if (providerIdentity.quotaSource === "zai_monitor" && authToken) {
+        logger?.debug?.(
+          {
+            runtimeId: input.runtimeId,
+            providerId: input.providerId ?? "anthropic",
+            profileId: input.profileId ?? null,
+            quotaAuthEnvVar: providerIdentity.apiKeyEnvVar,
+            providerFamily: providerIdentity.providerFamily,
+          },
+          "Refreshing Z.AI coding quota snapshot with resolved Claude auth identity",
+        );
+        try {
+          const providerSnapshot = await fetchZaiClaudeQuotaSnapshot({
+            runtimeId: input.runtimeId,
+            providerId: input.providerId ?? "anthropic",
+            profileId: input.profileId ?? null,
+            identity: providerIdentity,
+            authToken,
+            logger,
+          });
+          if (providerSnapshot) {
+            state.latestLimitSnapshot = providerSnapshot;
+            emitEvent(state, execution, buildRuntimeLimitEvent(providerSnapshot, "zai_monitor"));
+          }
+        } catch (error) {
+          logger?.warn?.(
+            {
+              runtimeId: input.runtimeId,
+              providerId: input.providerId ?? "anthropic",
+              profileId: input.profileId ?? null,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "Failed to refresh Z.AI coding quota snapshot after Claude CLI run",
+          );
+        }
+      }
+
+      resolve({
+        result: finalizeCliResult(state, fallbackSessionId),
+        startTimedOut: false,
+      });
+    });
+  });
+}
+
+export async function runClaudeCli(
+  input: RuntimeRunInput,
+  logger?: ClaudeCliLogger,
+  adapterDefaults?: { pathToClaudeCodeExecutable?: string },
+): Promise<RuntimeRunResult> {
+  const cliPath = resolveCliPath(input, adapterDefaults?.pathToClaudeCodeExecutable);
+  const args = buildCliArgs(input);
+  const execution = input.execution;
+  const options = asRecord(input.options);
+  const { identity: providerIdentity, authToken } = resolveClaudeProviderAuth({
+    providerId: input.providerId ?? "anthropic",
+    transport: "cli",
+    baseUrl: typeof options.baseUrl === "string" ? options.baseUrl : null,
+    apiKeyEnvVar: typeof options.apiKeyEnvVar === "string" ? options.apiKeyEnvVar : null,
+    apiKey: typeof options.apiKey === "string" ? options.apiKey : null,
+  });
+  const apiKeyEnvVar =
+    typeof options.apiKeyEnvVar === "string" ? options.apiKeyEnvVar : "ANTHROPIC_API_KEY";
+  const env = buildCuratedEnv(apiKeyEnvVar, {
+    ...resolveProfileEnvironment(input),
+    ...execution?.environment,
+  });
+
+  logger?.info?.(
+    {
+      runtimeId: input.runtimeId,
+      transport: "cli",
+      cliPath,
+      argCount: args.length,
+      startTimeoutMs: execution?.startTimeoutMs ?? null,
+      runTimeoutMs: execution?.runTimeoutMs ?? resolveTimeoutMs(input),
+      hasAgent: args.includes("--agent"),
+    },
+    "Starting Claude CLI run",
+  );
+
+  const { result, startTimedOut } = await runCliAttempt(
+    input,
+    cliPath,
+    args,
+    env,
+    providerIdentity,
+    authToken,
+    logger,
+  );
+
+  if (startTimedOut) {
+    // Single retry after start timeout
+    const retryDelayMs = resolveRetryDelay(execution ?? {});
+    logger?.warn?.(
+      { runtimeId: input.runtimeId, retryDelayMs },
+      "Claude CLI start timeout, retrying once after delay",
+    );
+    await sleepMs(retryDelayMs);
+
+    const retry = await runCliAttempt(
+      input,
+      cliPath,
+      args,
+      env,
+      providerIdentity,
+      authToken,
+      logger,
+    );
+    if (retry.startTimedOut) {
+      throw makeProcessStartTimeoutError(execution?.startTimeoutMs ?? 0);
+    }
+    return retry.result;
+  }
+
+  return result;
+}

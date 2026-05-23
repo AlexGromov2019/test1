@@ -1,0 +1,84 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Turborepo
+.turbo/
+
+# Database
+/data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Testing
+coverage/
+
+# Astro (generated)
+.astro/
+
+# Vite
+*.local
+
+# Playwright
+.playwright-mcp/
+playwright-report/
+test-results/
+/packages/web/playwright-report/
+/packages/web/test-results/
+
+# k6 perf reports
+/packages/api/perf/reports/
+
+# Claude Code
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/pr-review/
+
+# Codex and other agent
+/.codex/
+/.agents/
+/.github/skills
+/.junie/
+/.stryker-tmp/
+
+# AI Factory (keep tracked files, ignore generated)
+.ai-factory.json
+.ai-factory/skill-context/
+.mcp.json
+
+# HTML docs (generated)
+docs-html/
+
+# Misc
+.data
+.projects
+
+# Attachment files (stored inside project .ai-factory/files/)
+.ai-factory/files/
+.ai-factory/PLAN.md

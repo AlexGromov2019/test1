@@ -1,0 +1,750 @@
+import type {
+  RuntimeConnectionValidationInput,
+  RuntimeConnectionValidationResult,
+  RuntimeEvent,
+  RuntimeLimitSnapshot,
+  RuntimeLimitStatus,
+  RuntimeModel,
+  RuntimeModelListInput,
+  RuntimeRunInput,
+  RuntimeRunResult,
+  RuntimeUsage,
+} from "../../types.js";
+import { redactProviderText, redactProviderTextForLogs } from "@aif/shared";
+import { RuntimeExecutionError, type RuntimeExecutionErrorMetadata } from "../../errors.js";
+import { buildRuntimeLimitEvent } from "../../limitEvents.js";
+import { buildOpenAiCompatibleLimitSnapshot } from "../../openaiRateLimits.js";
+import { isRetriableTimeoutError, resolveRetryDelay, sleepMs } from "../../timeouts.js";
+import { classifyCodexRuntimeError } from "./errors.js";
+
+export interface CodexAgentApiLogger {
+  debug?(context: Record<string, unknown>, message: string): void;
+  info?(context: Record<string, unknown>, message: string): void;
+  warn?(context: Record<string, unknown>, message: string): void;
+}
+
+const DEFAULT_API_RETRY_COUNT = 2;
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+type CodexApiInput = RuntimeRunInput | RuntimeConnectionValidationInput | RuntimeModelListInput;
+
+const SENSITIVE_OPTION_KEYS = new Set(["apiKey", "apikey", "api_key", "secret", "password"]);
+
+function stripSensitiveOptions(
+  options: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!options) return options;
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(options)) {
+    if (!SENSITIVE_OPTION_KEYS.has(key)) {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
+}
+
+function safeProviderErrorMessage(rawText: string, fallbackMessage: string): string {
+  const trimmed = rawText.trim();
+  return trimmed.length > 0 ? redactProviderText(trimmed) : fallbackMessage;
+}
+
+function resolveApiKeyEnvVar(input: CodexApiInput): string {
+  const options = asRecord(input.options);
+  const topLevelApiKeyEnvVar = "apiKeyEnvVar" in input ? readString(input.apiKeyEnvVar) : null;
+  return topLevelApiKeyEnvVar ?? readString(options.apiKeyEnvVar) ?? "OPENAI_API_KEY";
+}
+
+function resolveBaseUrl(input: CodexApiInput): string {
+  const options = asRecord(input.options);
+  const baseUrl =
+    ("baseUrl" in input ? readString(input.baseUrl) : null) ??
+    readString(options.agentApiBaseUrl) ??
+    readString(options.baseUrl) ??
+    readString(process.env.OPENAI_BASE_URL);
+  if (!baseUrl) {
+    throw classifyCodexRuntimeError("Codex API transport requires baseUrl or OPENAI_BASE_URL");
+  }
+  return baseUrl.replace(/\/+$/, "");
+}
+
+function resolveApiKey(input: CodexApiInput): string | null {
+  const options = asRecord(input.options);
+  const apiKeyEnvVar = resolveApiKeyEnvVar(input);
+  return (
+    ("apiKey" in input ? readString(input.apiKey) : null) ??
+    readString(options.apiKey) ??
+    readString(process.env[apiKeyEnvVar]) ??
+    readString(process.env.OPENAI_API_KEY)
+  );
+}
+
+function buildHeaders(input: CodexApiInput): Headers {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  const apiKey = resolveApiKey(input);
+  if (apiKey) {
+    headers.set("Authorization", `Bearer ${apiKey}`);
+  }
+
+  const rawHeaders = {
+    ...asRecord(asRecord(input.options).headers),
+    ...("headers" in input ? asRecord(input.headers) : {}),
+  };
+  for (const [key, value] of Object.entries(rawHeaders)) {
+    if (typeof value === "string") {
+      headers.set(key, value);
+    }
+  }
+
+  return headers;
+}
+
+function resolveApiRetryCount(input: RuntimeRunInput): number {
+  const options = asRecord(input.options);
+  const fromOptions = options.apiRetryCount;
+  const fromEnv = process.env.CODEX_API_RETRY_COUNT;
+  const raw =
+    typeof fromOptions === "number"
+      ? fromOptions
+      : typeof fromOptions === "string"
+        ? Number.parseInt(fromOptions, 10)
+        : fromEnv
+          ? Number.parseInt(fromEnv, 10)
+          : DEFAULT_API_RETRY_COUNT;
+
+  if (!Number.isFinite(raw) || raw < 0) {
+    return DEFAULT_API_RETRY_COUNT;
+  }
+  return Math.floor(raw);
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status >= 500 && status < 600;
+}
+
+/**
+ * String matching is intentional here: Node's native `fetch` throws
+ * `TypeError("fetch failed")` with no structured cause or HTTP status.
+ * Network-level errors (ECONNRESET, ECONNREFUSED) are surfaced only
+ * in the error message string. No structured alternative exists.
+ */
+function isRetryableFetchError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const lowered = message.toLowerCase();
+  return (
+    lowered.includes("fetch failed") ||
+    lowered.includes("network") ||
+    lowered.includes("econnreset") ||
+    lowered.includes("econnrefused") ||
+    lowered.includes("timed out") ||
+    lowered.includes("etimedout")
+  );
+}
+
+function retryBackoffMs(attempt: number): number {
+  return 150 * (attempt + 1);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetries(
+  input: RuntimeRunInput,
+  url: string,
+  init: RequestInit,
+  logger: CodexAgentApiLogger | undefined,
+  requestType: "non-stream" | "stream",
+): Promise<Response> {
+  const maxRetries = resolveApiRetryCount(input);
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const response = await fetch(url, init);
+      if (isRetryableStatus(response.status) && attempt < maxRetries) {
+        const delayMs = retryBackoffMs(attempt);
+        logger?.warn?.(
+          {
+            runtimeId: input.runtimeId,
+            status: response.status,
+            attempt: attempt + 1,
+            maxRetries,
+            delayMs,
+            requestType,
+          },
+          "OpenAI API returned retryable status, retrying",
+        );
+        await sleep(delayMs);
+        continue;
+      }
+      return response;
+    } catch (error) {
+      if (attempt < maxRetries && isRetryableFetchError(error)) {
+        const delayMs = retryBackoffMs(attempt);
+        logger?.warn?.(
+          {
+            runtimeId: input.runtimeId,
+            error: error instanceof Error ? error.message : String(error),
+            attempt: attempt + 1,
+            maxRetries,
+            delayMs,
+            requestType,
+          },
+          "OpenAI API request failed with retryable transport error, retrying",
+        );
+        await sleep(delayMs);
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Messages & request body (OpenAI Chat Completions format)
+// ---------------------------------------------------------------------------
+
+interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+function buildMessages(input: RuntimeRunInput): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+
+  let systemContent = input.systemPrompt ?? "";
+  if (input.execution?.systemPromptAppend) {
+    systemContent = systemContent
+      ? `${systemContent}\n\n${input.execution.systemPromptAppend}`
+      : input.execution.systemPromptAppend;
+  }
+  if (systemContent) {
+    messages.push({ role: "system", content: systemContent });
+  }
+
+  messages.push({ role: "user", content: input.prompt });
+  return messages;
+}
+
+function buildRequestBody(input: RuntimeRunInput, stream: boolean): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: input.model,
+    messages: buildMessages(input),
+    stream,
+  };
+
+  if (input.execution?.outputSchema) {
+    body.response_format = {
+      type: "json_schema",
+      json_schema: {
+        name: "response",
+        strict: true,
+        schema: input.execution.outputSchema,
+      },
+    };
+  }
+
+  return body;
+}
+
+// ---------------------------------------------------------------------------
+// Usage normalization
+// ---------------------------------------------------------------------------
+
+function normalizeUsage(usage: unknown): RuntimeUsage | null {
+  if (!usage || typeof usage !== "object") return null;
+  const parsed = usage as Record<string, unknown>;
+  const inputTokens = (parsed.prompt_tokens as number) ?? (parsed.inputTokens as number) ?? 0;
+  const outputTokens = (parsed.completion_tokens as number) ?? (parsed.outputTokens as number) ?? 0;
+  const totalTokens =
+    (parsed.total_tokens as number) ?? (parsed.totalTokens as number) ?? inputTokens + outputTokens;
+  const costUsd =
+    typeof parsed.cost === "number"
+      ? parsed.cost
+      : typeof parsed.costUsd === "number"
+        ? parsed.costUsd
+        : undefined;
+  return { inputTokens, outputTokens, totalTokens, costUsd };
+}
+
+// ---------------------------------------------------------------------------
+// Timeout signal helpers
+// ---------------------------------------------------------------------------
+
+function buildRunTimeoutSignal(input: RuntimeRunInput): AbortSignal | undefined {
+  const runMs = input.execution?.runTimeoutMs;
+  const externalAbort = input.execution?.abortController;
+
+  const signals: AbortSignal[] = [];
+  if (typeof runMs === "number" && Number.isFinite(runMs) && runMs > 0) {
+    signals.push(AbortSignal.timeout(Math.floor(runMs)));
+  }
+  if (externalAbort) {
+    signals.push(externalAbort.signal);
+  }
+
+  if (signals.length === 0) return undefined;
+  if (signals.length === 1) return signals[0];
+  return AbortSignal.any(signals);
+}
+
+function isAbortTimeoutError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "TimeoutError";
+}
+
+function hasOpenAiRateLimitHints(headers: Headers): boolean {
+  return [
+    "retry-after",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+  ].some((name) => headers.has(name));
+}
+
+function buildCodexLimitSnapshot(
+  input: RuntimeRunInput,
+  headers: Headers,
+  statusOverride?: RuntimeLimitStatus,
+): RuntimeLimitSnapshot | null {
+  return buildOpenAiCompatibleLimitSnapshot(headers, {
+    providerId: input.providerId ?? "openai",
+    runtimeId: input.runtimeId,
+    profileId: input.profileId ?? null,
+    statusOverride,
+  });
+}
+
+function buildLimitErrorMetadata(
+  snapshot: RuntimeLimitSnapshot | null,
+  httpStatus?: number,
+): RuntimeExecutionErrorMetadata {
+  const retryAfterSeconds = snapshot?.retryAfterSeconds ?? null;
+  return {
+    httpStatus,
+    resetAt: snapshot?.resetAt ?? null,
+    retryAfterSeconds,
+    retryAfterMs: retryAfterSeconds != null ? retryAfterSeconds * 1000 : null,
+    limitSnapshot: snapshot,
+    providerMeta: snapshot?.providerMeta ?? null,
+  };
+}
+
+function emitLimitSnapshotEvent(
+  input: RuntimeRunInput,
+  events: RuntimeEvent[],
+  snapshot: RuntimeLimitSnapshot | null,
+  logger?: CodexAgentApiLogger,
+): void {
+  if (!snapshot) return;
+
+  const event = buildRuntimeLimitEvent(snapshot);
+  events.push(event);
+  input.execution?.onEvent?.(event);
+  logger?.debug?.(
+    {
+      runtimeId: input.runtimeId,
+      providerId: snapshot.providerId,
+      profileId: snapshot.profileId ?? null,
+      status: snapshot.status,
+      precision: snapshot.precision,
+      source: snapshot.source,
+      primaryScope: snapshot.primaryScope ?? null,
+      resetAt: snapshot.resetAt ?? null,
+    },
+    "Translated OpenAI-compatible rate-limit headers into runtime limit snapshot",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming run (OpenAI Chat Completions)
+// ---------------------------------------------------------------------------
+
+export async function runCodexAgentApi(
+  input: RuntimeRunInput,
+  logger?: CodexAgentApiLogger,
+): Promise<RuntimeRunResult> {
+  const baseUrl = resolveBaseUrl(input);
+  const url = `${baseUrl}/chat/completions`;
+
+  logger?.info?.(
+    {
+      runtimeId: input.runtimeId,
+      transport: "api",
+      url,
+      model: input.model ?? null,
+      runTimeoutMs: input.execution?.runTimeoutMs ?? null,
+      options: stripSensitiveOptions(asRecord(input.options)),
+    },
+    "Starting OpenAI API run",
+  );
+
+  try {
+    const signal = buildRunTimeoutSignal(input);
+    const response = await fetchWithRetries(
+      input,
+      url,
+      {
+        method: "POST",
+        headers: buildHeaders(input),
+        body: JSON.stringify(buildRequestBody(input, false)),
+        ...(signal ? { signal } : {}),
+      },
+      logger,
+      "non-stream",
+    );
+
+    const rawText = await response.text();
+    const limitSnapshot = buildCodexLimitSnapshot(
+      input,
+      response.headers,
+      response.status === 429 ? "blocked" : undefined,
+    );
+    if (!limitSnapshot && hasOpenAiRateLimitHints(response.headers)) {
+      logger?.warn?.(
+        {
+          runtimeId: input.runtimeId,
+          providerId: input.providerId ?? "openai",
+          profileId: input.profileId ?? null,
+          status: response.status,
+        },
+        "Dropped OpenAI-compatible rate-limit metadata because it could not be normalized",
+      );
+    }
+
+    if (!response.ok) {
+      return Promise.reject(
+        classifyCodexRuntimeError(
+          new Error(safeProviderErrorMessage(rawText, "Codex API request failed")),
+          response.status,
+          buildLimitErrorMetadata(limitSnapshot, response.status),
+        ),
+      );
+    }
+
+    const payload = rawText.trim().length > 0 ? JSON.parse(rawText) : {};
+    const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
+    const outputText = choice?.message?.content ?? "";
+    const events: RuntimeEvent[] = [];
+    emitLimitSnapshotEvent(input, events, limitSnapshot, logger);
+
+    logger?.debug?.(
+      {
+        runtimeId: input.runtimeId,
+        hasOutput: outputText.length > 0,
+        usage: payload.usage ?? null,
+      },
+      "OpenAI API run completed",
+    );
+
+    return {
+      outputText,
+      sessionId: payload.id ?? null,
+      usage: normalizeUsage(payload.usage),
+      ...(events.length > 0 ? { events } : {}),
+      raw: payload,
+    };
+  } catch (error) {
+    if (isAbortTimeoutError(error)) {
+      throw new RuntimeExecutionError(
+        `Run timeout: Codex API request exceeded ${input.execution?.runTimeoutMs}ms limit`,
+        error,
+        "timeout",
+      );
+    }
+    throw classifyCodexRuntimeError(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming run (SSE, OpenAI Chat Completions)
+// ---------------------------------------------------------------------------
+
+async function runCodexStreamingAttempt(
+  input: RuntimeRunInput,
+  logger?: CodexAgentApiLogger,
+): Promise<RuntimeRunResult> {
+  const baseUrl = resolveBaseUrl(input);
+  const url = `${baseUrl}/chat/completions`;
+  const signal = buildRunTimeoutSignal(input);
+
+  const response = await fetchWithRetries(
+    input,
+    url,
+    {
+      method: "POST",
+      headers: buildHeaders(input),
+      body: JSON.stringify(buildRequestBody(input, true)),
+      ...(signal ? { signal } : {}),
+    },
+    logger,
+    "stream",
+  );
+
+  const limitSnapshot = buildCodexLimitSnapshot(
+    input,
+    response.headers,
+    response.status === 429 ? "blocked" : undefined,
+  );
+  if (!limitSnapshot && hasOpenAiRateLimitHints(response.headers)) {
+    logger?.warn?.(
+      {
+        runtimeId: input.runtimeId,
+        providerId: input.providerId ?? "openai",
+        profileId: input.profileId ?? null,
+        status: response.status,
+      },
+      "Dropped OpenAI-compatible rate-limit metadata because it could not be normalized",
+    );
+  }
+
+  if (!response.ok) {
+    const rawText = await response.text();
+    throw classifyCodexRuntimeError(
+      new Error(safeProviderErrorMessage(rawText, "Codex API streaming request failed")),
+      response.status,
+      buildLimitErrorMetadata(limitSnapshot, response.status),
+    );
+  }
+
+  if (!response.body) {
+    throw classifyCodexRuntimeError(
+      new Error("OpenAI API streaming response has no body"),
+      undefined,
+      buildLimitErrorMetadata(limitSnapshot),
+    );
+  }
+
+  let outputText = "";
+  let sessionId: string | null = null;
+  let usage: RuntimeUsage | null = null;
+  const events: RuntimeEvent[] = [];
+  emitLimitSnapshotEvent(input, events, limitSnapshot, logger);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let firstChunkReceived = false;
+
+  // Start timeout — detect hung stream after connection is established
+  const startMs = input.execution?.startTimeoutMs;
+  let startTimer: ReturnType<typeof setTimeout> | null = null;
+  let startTimedOut = false;
+
+  if (typeof startMs === "number" && Number.isFinite(startMs) && startMs > 0) {
+    startTimer = setTimeout(() => {
+      startTimedOut = true;
+      reader.cancel().catch(() => {});
+    }, startMs);
+  }
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      if (!firstChunkReceived) {
+        firstChunkReceived = true;
+        if (startTimer) {
+          clearTimeout(startTimer);
+          startTimer = null;
+        }
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(":")) continue;
+        if (!trimmed.startsWith("data: ")) continue;
+
+        const data = trimmed.slice(6);
+        if (data === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          if (!sessionId && parsed.id) {
+            sessionId = parsed.id;
+          }
+
+          const delta = parsed.choices?.[0]?.delta;
+          if (delta?.content) {
+            outputText += delta.content;
+            const event: RuntimeEvent = {
+              type: "stream:text",
+              timestamp: new Date().toISOString(),
+              message: delta.content,
+            };
+            events.push(event);
+            input.execution?.onEvent?.(event);
+          }
+
+          if (parsed.usage) {
+            usage = normalizeUsage(parsed.usage);
+          }
+        } catch {
+          logger?.debug?.(
+            { runtimeId: input.runtimeId, rawLine: redactProviderTextForLogs(trimmed) },
+            "Failed to parse SSE chunk, skipping",
+          );
+        }
+      }
+    }
+  } finally {
+    if (startTimer) clearTimeout(startTimer);
+    reader.releaseLock();
+  }
+
+  if (startTimedOut) {
+    const err = new RuntimeExecutionError(
+      `Start timeout: Codex API streaming produced no data within ${startMs}ms`,
+      undefined,
+      "timeout",
+      buildLimitErrorMetadata(limitSnapshot),
+    );
+    (err as unknown as Record<string, unknown>).__timeoutRetriable__ = true;
+    throw err;
+  }
+
+  logger?.debug?.(
+    {
+      runtimeId: input.runtimeId,
+      outputLength: outputText.length,
+      eventCount: events.length,
+    },
+    "OpenAI API streaming run completed",
+  );
+
+  return {
+    outputText,
+    sessionId,
+    usage,
+    events,
+    raw: { streaming: true, eventCount: events.length },
+  };
+}
+
+export async function runCodexAgentApiStreaming(
+  input: RuntimeRunInput,
+  logger?: CodexAgentApiLogger,
+): Promise<RuntimeRunResult> {
+  logger?.info?.(
+    {
+      runtimeId: input.runtimeId,
+      transport: "api",
+      model: input.model ?? null,
+      streaming: true,
+      startTimeoutMs: input.execution?.startTimeoutMs ?? null,
+      runTimeoutMs: input.execution?.runTimeoutMs ?? null,
+    },
+    "Starting OpenAI API streaming run",
+  );
+
+  try {
+    return await runCodexStreamingAttempt(input, logger);
+  } catch (error) {
+    if (isRetriableTimeoutError(error)) {
+      const retryDelayMs = resolveRetryDelay(input.execution ?? {});
+      logger?.warn?.(
+        { runtimeId: input.runtimeId, retryDelayMs },
+        "Codex API streaming start timeout, retrying once after delay",
+      );
+      await sleepMs(retryDelayMs);
+      return runCodexStreamingAttempt(input, logger);
+    }
+    if (isAbortTimeoutError(error)) {
+      throw new RuntimeExecutionError(
+        `Run timeout: Codex API streaming request exceeded ${input.execution?.runTimeoutMs}ms limit`,
+        error,
+        "timeout",
+      );
+    }
+    throw classifyCodexRuntimeError(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Connection validation
+// ---------------------------------------------------------------------------
+
+export async function validateCodexAgentApiConnection(
+  input: RuntimeConnectionValidationInput,
+): Promise<RuntimeConnectionValidationResult> {
+  const baseUrl = resolveBaseUrl(input);
+  const url = `${baseUrl}/models`;
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: buildHeaders(input),
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        message: `OpenAI API health check failed with status ${response.status}`,
+      };
+    }
+    return {
+      ok: true,
+      message: "OpenAI API connection validated",
+    };
+  } catch (error) {
+    throw classifyCodexRuntimeError(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model discovery
+// ---------------------------------------------------------------------------
+
+export async function listCodexAgentApiModels(
+  input: RuntimeConnectionValidationInput | RuntimeModelListInput,
+): Promise<RuntimeModel[]> {
+  const inputWithOptions = input as RuntimeConnectionValidationInput;
+  const baseUrl = resolveBaseUrl(inputWithOptions);
+  const url = `${baseUrl}/models`;
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: buildHeaders(inputWithOptions),
+    });
+    if (!response.ok) {
+      const rawText = await response.text();
+      return Promise.reject(
+        classifyCodexRuntimeError(
+          new Error(safeProviderErrorMessage(rawText, "Codex API model listing failed")),
+          response.status,
+        ),
+      );
+    }
+    const payload = (await response.json()) as {
+      data?: Array<{
+        id: string;
+        name?: string;
+        owned_by?: string;
+      }>;
+    };
+    const models = payload.data ?? [];
+    return models.map((model) => ({
+      id: model.id,
+      label: model.name ?? model.id,
+      supportsStreaming: true,
+      metadata: { owned_by: model.owned_by },
+    }));
+  } catch (error) {
+    throw classifyCodexRuntimeError(error);
+  }
+}

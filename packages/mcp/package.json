@@ -1,0 +1,28 @@
+{
+  "name": "@aif/mcp",
+  "version": "0.1.0",
+  "description": "MCP server for bidirectional AIF sync with Handoff",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "dev": "node ./scripts/dev-http.mjs",
+    "build": "tsc",
+    "test": "vitest run --passWithNoTests --configLoader runner",
+    "coverage": "vitest run --coverage --passWithNoTests",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test:watch": "vitest --configLoader runner"
+  },
+  "dependencies": {
+    "@aif/data": "*",
+    "@aif/shared": "*",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.2"
+  }
+}
